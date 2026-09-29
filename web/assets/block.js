@@ -111,6 +111,7 @@ function blockAmount(b) {
     case 'lease':
     case 'lease_accept':
     case 'lease_settle':
+    case 'lease_renew':
       return b.amount != null ? formatAmount(b.amount, b.asset) : '–';
     default:
       return '–';

@@ -111,13 +111,36 @@ func (l *Ledger) escrowPendingOf(leaseHash string) *PendingSend {
 	if lb == nil || lb.Type != BlockLease {
 		return nil
 	}
+
+	amount := lb.Amount
+	if ls, ok := l.store.(LeaseStore); ok {
+		if lease, err := ls.GetLease(leaseHash); err == nil && lease != nil {
+			for i := range lease.Renewals {
+				amount += lease.Renewals[i].Cost
+			}
+		}
+	}
 	return &PendingSend{
 		SendHash:    lb.Hash,
 		Source:      lb.Account,
 		Destination: lb.Destination,
-		Amount:      lb.Amount,
+		Amount:      amount,
 		Asset:       "XUSD",
 	}
+}
+
+func (l *Ledger) priorLeasePopRenewal(leaseHash string) *Lease {
+	ls, ok := l.store.(LeaseStore)
+	if !ok {
+		return nil
+	}
+	cur, err := ls.GetLease(leaseHash)
+	if err != nil || cur == nil || len(cur.Renewals) == 0 {
+		return nil
+	}
+	restored := *cur
+	restored.Renewals = append([]LeaseSegment(nil), cur.Renewals[:len(cur.Renewals)-1]...)
+	return &restored
 }
 
 func assetBalanceOnChain(chain *AccountChain, asset string) uint64 {
@@ -172,6 +195,8 @@ func (l *Ledger) buildBlockUndo(account string, b *Block, chain *AccountChain) (
 
 	var deletePendingID, deleteLeaseHash, deleteKeysetAccount string
 	var addPending *PendingSend
+	var reducePendingID string
+	var reducePendingAmount uint64
 	var restoreLease *Lease
 	var assetDebit *AssetDelta
 	switch b.Type {
@@ -211,6 +236,11 @@ func (l *Ledger) buildBlockUndo(account string, b *Block, chain *AccountChain) (
 
 		restoreLease = l.priorLease(b.Source, LeaseCreated)
 		addPending = l.escrowPendingOf(b.Source)
+	case BlockLeaseRenew:
+
+		restoreLease = l.priorLeasePopRenewal(b.Source)
+		reducePendingID = b.Source
+		reducePendingAmount = b.Amount
 	case BlockMultisigOpen:
 		deleteKeysetAccount = b.Account
 	case BlockMultisigUpdate:
@@ -219,7 +249,7 @@ func (l *Ledger) buildBlockUndo(account string, b *Block, chain *AccountChain) (
 	case BlockBurn, BlockMint:
 
 	}
-	if (b.Type == BlockLeaseAccept || b.Type == BlockLeaseSettle || b.Type == BlockLeaseForceSettle || b.Type == BlockLeaseCancel) && restoreLease == nil {
+	if (b.Type == BlockLeaseAccept || b.Type == BlockLeaseSettle || b.Type == BlockLeaseForceSettle || b.Type == BlockLeaseCancel || b.Type == BlockLeaseRenew) && restoreLease == nil {
 		return nil, nil, fmt.Errorf("undo: lease %s not found while reversing %s", shortHash(b.Source), b.Type)
 	}
 
@@ -281,6 +311,8 @@ func (l *Ledger) buildBlockUndo(account string, b *Block, chain *AccountChain) (
 		PrevRep:                 prevRep,
 		RestoreLease:            restoreLease,
 		DeleteLeaseHash:         deleteLeaseHash,
+		ReducePendingID:         reducePendingID,
+		ReducePendingAmount:     reducePendingAmount,
 		DeleteKeysetAccount:     deleteKeysetAccount,
 		DeleteAccountKeyAccount: deleteAccountKeyAccount,
 		AssetDebit:              assetDebit,

@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"log"
 	"math"
@@ -29,6 +33,7 @@ import (
 	"github.com/xeprotocol/xe/logging"
 	"github.com/xeprotocol/xe/node"
 	"github.com/xeprotocol/xe/web"
+	"golang.org/x/term"
 )
 
 var version = "dev"
@@ -47,11 +52,19 @@ func main() {
 		cmdNode(args)
 	case "wallet":
 		if len(args) == 0 {
-			fatal("usage: xe wallet <create|balance>")
+			fatal("usage: xe wallet <create|restore|phrase|balance>")
 		}
 		switch args[0] {
 		case "create":
 			cmdWalletCreate()
+		case "restore":
+			if len(args) > 1 {
+
+				fatal("wallet restore does not take the phrase as arguments, because they leak into shell history and ps: pipe it on stdin or type it at the prompt, and clear this command from your shell history")
+			}
+			cmdWalletRestore()
+		case "phrase":
+			cmdWalletPhrase()
 		case "balance":
 			cmdWalletBalance()
 		default:
@@ -86,6 +99,11 @@ func main() {
 				fatal("usage: xe lease status <hash>")
 			}
 			cmdLeaseStatus(args[1])
+		} else if len(args) > 0 && args[0] == "renew" {
+			if len(args) < 3 {
+				fatal("usage: xe lease renew <hash> <additional-seconds>  (operator: requires XE_API_ADMIN_TOKEN)")
+			}
+			cmdLeaseRenew(args[1], args[2])
 		} else {
 			cmdLease(args)
 		}
@@ -144,7 +162,11 @@ Node:
                             --wallet (default true)  expose /wallet/ in the embedded UI
 
 Wallet:
-  wallet create           Create a new wallet
+  wallet create           Create a new wallet and show its recovery phrase
+  wallet restore          Restore a wallet from its 24-word recovery phrase,
+                          read from stdin (a prompt, or piped), never from
+                          arguments. Refuses to overwrite an existing wallet
+  wallet phrase           Show the recovery phrase of the current wallet
   wallet balance          Show wallet balance
 
 Transactions:
@@ -235,17 +257,24 @@ func initNetworkID() {
 }
 
 func loadWallet() *core.KeyPair {
-	path := walletPath()
+	seed, err := readWalletSeed(walletPath())
+	if err != nil {
+		fatal("%v", err)
+	}
+	return core.KeyPairFromSeed(seed)
+}
+
+func readWalletSeed(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fatal("no wallet found at %s — run: xe wallet create", path)
+		return nil, fmt.Errorf("no wallet found at %s — run: xe wallet create", path)
 	}
 	seedHex := strings.TrimSpace(string(data))
 	seed, err := hex.DecodeString(seedHex)
 	if err != nil || len(seed) != 32 {
-		fatal("corrupt wallet file: %s", path)
+		return nil, fmt.Errorf("corrupt wallet file: %s", path)
 	}
-	return core.KeyPairFromSeed(seed)
+	return seed, nil
 }
 
 func cmdWalletCreate() {
@@ -277,6 +306,154 @@ func cmdWalletCreate() {
 	fmt.Printf("  Address:    %s\n", kp.Address())
 	fmt.Printf("  Public key: %s\n", kp.PubKeyHex())
 	fmt.Printf("  File:       %s\n", path)
+
+	phrase, err := core.PhraseFromSeed(kp.Private.Seed())
+	if err != nil {
+		fatal("recovery phrase: %v", err)
+	}
+	fmt.Printf("\nRecovery phrase:\n\n")
+	printNumberedPhrase(phrase)
+	fmt.Printf("\n%s\n", recoveryPhraseWarning)
+}
+
+const recoveryPhraseWarning = `Write these 24 words down and keep them safe. They are the only backup of this
+wallet, and anyone who has them controls it. Only XE software can restore them:
+a standard BIP39 wallet reads the same words as a different, empty account.`
+
+func printNumberedPhrase(phrase string) {
+	for i, word := range strings.Fields(phrase) {
+		if i%4 == 3 {
+			fmt.Printf("  %2d. %s\n", i+1, word)
+		} else {
+			fmt.Printf("  %2d. %-8s", i+1, word)
+		}
+	}
+}
+
+func cmdWalletRestore() {
+	path := walletPath()
+
+	if _, err := os.Stat(path); err == nil {
+		fatal("%v", errWalletExists(path))
+	}
+
+	var in io.Reader = os.Stdin
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+
+		if state, err := term.GetState(fd); err == nil {
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+			go func() {
+				<-sig
+				_ = term.Restore(fd, state)
+				fmt.Fprintln(os.Stderr)
+				os.Exit(130)
+			}()
+		}
+		fmt.Fprintf(os.Stderr, "Enter your %d-word recovery phrase, one or more words per line. Input is hidden.\n", core.RecoveryPhraseWords)
+		in = &hiddenLineReader{fd: fd}
+	}
+
+	kp, err := restoreWallet(in, path)
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Printf("Wallet restored!\n")
+	fmt.Printf("  Address:    %s\n", kp.Address())
+	fmt.Printf("  Public key: %s\n", kp.PubKeyHex())
+	fmt.Printf("  File:       %s\n", path)
+}
+
+func restoreWallet(r io.Reader, path string) (*core.KeyPair, error) {
+	phrase, err := readPhrase(r)
+	if err != nil {
+		return nil, err
+	}
+	seed, err := core.SeedFromPhrase(phrase)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeNewWalletSeed(path, seed); err != nil {
+		return nil, err
+	}
+	return core.KeyPairFromSeed(seed), nil
+}
+
+func readPhrase(r io.Reader) (string, error) {
+	var words []string
+	sc := bufio.NewScanner(r)
+	for len(words) < core.RecoveryPhraseWords && sc.Scan() {
+		words = append(words, strings.Fields(sc.Text())...)
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("read recovery phrase: %w", err)
+	}
+	return strings.Join(words, " "), nil
+}
+
+func writeNewWalletSeed(path string, seed []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("create wallet dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, iofs.ErrExist) {
+		return errWalletExists(path)
+	}
+	if err != nil {
+		return fmt.Errorf("write wallet: %w", err)
+	}
+	_, err = f.WriteString(hex.EncodeToString(seed) + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+
+		_ = os.Remove(path)
+		return fmt.Errorf("write wallet: %w", err)
+	}
+	return nil
+}
+
+func errWalletExists(path string) error {
+	return fmt.Errorf("wallet already exists at %s: restore will not overwrite it", path)
+}
+
+type hiddenLineReader struct {
+	fd    int
+	buf   []byte
+	words int
+}
+
+func (h *hiddenLineReader) Read(p []byte) (int, error) {
+	if len(h.buf) == 0 {
+		line, err := term.ReadPassword(h.fd)
+		if err != nil {
+			return 0, err
+		}
+		h.words += len(strings.Fields(string(line)))
+		fmt.Fprintf(os.Stderr, "  %d of %d words\n", h.words, core.RecoveryPhraseWords)
+		h.buf = append(line, '\n')
+	}
+	n := copy(p, h.buf)
+	h.buf = h.buf[n:]
+	return n, nil
+}
+
+func cmdWalletPhrase() {
+	phrase, err := walletPhrase(walletPath())
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println(phrase)
+	fmt.Fprintf(os.Stderr, "\n%s\n", recoveryPhraseWarning)
+}
+
+func walletPhrase(path string) (string, error) {
+	seed, err := readWalletSeed(path)
+	if err != nil {
+		return "", err
+	}
+	return core.PhraseFromSeed(seed)
 }
 
 func cmdWalletBalance() {
@@ -756,6 +933,33 @@ func cmdLeaseStatus(hash string) {
 	}
 	data, _ := json.MarshalIndent(lease, "", "  ")
 	fmt.Println(string(data))
+}
+
+func cmdLeaseRenew(hash, secsStr string) {
+	secs, err := strconv.ParseUint(secsStr, 10, 64)
+	if err != nil || secs == 0 {
+		fatal("additional-seconds must be a positive integer, got %q", secsStr)
+	}
+	token := os.Getenv("XE_API_ADMIN_TOKEN")
+	if token == "" {
+		fatal("xe lease renew needs XE_API_ADMIN_TOKEN set to this node's operator token")
+	}
+	body, _ := json.Marshal(map[string]any{"additional_secs": secs})
+	req, _ := http.NewRequest("POST", nodeURL()+"/lease/"+hash+"/renew", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fatal("renew request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		fatal("renew rejected (%d): %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+	}
+	var out map[string]any
+	_ = json.Unmarshal(rb, &out)
+	fmt.Printf("Renewed lease %s: +%ss (renew block %v, cost %v XUSD)\n", shortAddr(hash), secsStr, out["renew_hash"], out["cost"])
 }
 
 func cmdReputation(addr string) {

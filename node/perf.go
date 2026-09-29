@@ -18,7 +18,18 @@ const (
 
 	certRetryInitialDelay = 15 * time.Second
 	certRetryMaxDelay     = 5 * time.Minute
+
+	certRenewalLeadDivisor = 7
+
+	certScoreChangeFactor = 2.0
 )
+
+type localCertificate struct {
+	cert      *perf.Certificate
+	nonces    []uint64
+	startAtts []core.TimekeeperAttestation
+	endAtts   []core.TimekeeperAttestation
+}
 
 func (n *Node) generatePerformanceCertificate() error {
 	tkConfig := n.getTimekeeperConfig()
@@ -30,7 +41,7 @@ func (n *Node) generatePerformanceCertificate() error {
 	startID := providerHex
 	endID := providerHex[:32] + "0000000000000000" + providerHex[48:]
 
-	log.Printf("Generating performance certificate (%d iterations)...", perf.BenchmarkIterations)
+	log.Printf("Generating performance certificate (%d puzzles)...", perf.PoWPuzzles)
 
 	startAtts, err := n.gatherAttestations(startID, tkConfig)
 	if err != nil {
@@ -44,7 +55,7 @@ func (n *Node) generatePerformanceCertificate() error {
 
 	providerPubkey, _ := hex.DecodeString(n.KeyPair.PubKeyHex())
 	seed := perf.DeriveSeed(startMedian, providerPubkey)
-	result := perf.RunBenchmark(seed, perf.BenchmarkIterations)
+	result := perf.RunBenchmark(seed, perf.PoWPuzzles)
 	log.Printf("Performance certificate: benchmark completed in %s (score=%.4f)",
 		result.Elapsed, result.Score())
 
@@ -77,11 +88,13 @@ func (n *Node) generatePerformanceCertificate() error {
 			priceMult, float64(priceMult)/1000.0)
 	}
 	cert := &perf.Certificate{
-		Provider:             n.KeyPair.Address(),
-		Seed:                 perf.SeedHex(seed),
-		WorkloadVersion:      perf.WorkloadVersion,
-		Iterations:           perf.BenchmarkIterations,
-		WorkProof:            hex.EncodeToString(result.FinalHash[:]),
+		Provider:        n.KeyPair.Address(),
+		Seed:            perf.SeedHex(seed),
+		WorkloadVersion: perf.WorkloadVersion,
+		Puzzles:         perf.PoWPuzzles,
+		WorkProof:       hex.EncodeToString(result.FinalHash[:]),
+
+		CPUHash:              hex.EncodeToString(result.CPUHash[:]),
 		Score:                score,
 		StartAttestationRoot: perf.AttestationMerkleRoot(startAtts),
 		EndAttestationRoot:   perf.AttestationMerkleRoot(endAtts),
@@ -95,14 +108,79 @@ func (n *Node) generatePerformanceCertificate() error {
 		return fmt.Errorf("signing failed: %w", err)
 	}
 
-	n.perfCert.Store(cert)
+	n.installCertificate(&localCertificate{
+		cert:      cert,
+		nonces:    result.Nonces,
+		startAtts: startAtts,
+		endAtts:   endAtts,
+	})
+	return nil
+}
+
+func (n *Node) installCertificate(lc *localCertificate) {
+	cert := lc.cert
+	prev := n.perfCert.Swap(lc)
+	if prev != nil && prev.cert.Hash != cert.Hash {
+		n.retainCertificate(prev.cert)
+		if significantScoreChange(prev.cert.Score, cert.Score) {
+			logging.Warnf("Performance certificate: renewed score %.4f differs from predecessor %s score %.4f by more than %.0fx "+
+				"(a lower score can reflect load during the benchmark)",
+				cert.Score, shortHash(prev.cert.Hash), prev.cert.Score, certScoreChangeFactor)
+		}
+	}
 	log.Printf("Performance certificate generated: hash=%s score=%.4f multiplier=%d expires_in=%s",
-		shortHash(cert.Hash), cert.Score, priceMult, perf.CertificateValidity)
+		shortHash(cert.Hash), cert.Score, cert.PriceMultiplierMilli, time.Duration(cert.ExpiresAt-cert.IssuedAt))
 
 	if err := n.CertGossip.Publish(n.ctx, cert); err != nil {
 		log.Printf("Performance certificate: gossip publish failed: %v", err)
 	}
-	return nil
+}
+
+func significantScoreChange(prev, next float64) bool {
+	if prev <= 0 || next <= 0 {
+		return false
+	}
+	return next > prev*certScoreChangeFactor || next < prev/certScoreChangeFactor
+}
+
+func certRenewalDelay(cert *perf.Certificate, now int64) time.Duration {
+	lifetime := cert.ExpiresAt - cert.IssuedAt
+	if lifetime <= 0 {
+		lifetime = int64(perf.CertificateValidity)
+	}
+	renewAt := cert.ExpiresAt - lifetime/certRenewalLeadDivisor
+	if renewAt <= now {
+		return 0
+	}
+	return time.Duration(renewAt - now)
+}
+
+func (n *Node) maintainCertificate(issue func() error, initialDelay, maxDelay time.Duration) {
+	issued := false
+	for {
+		if lc := n.perfCert.Load(); lc != nil {
+			wait := certRenewalDelay(lc.cert, core.Now().UnixNano())
+
+			if issued && wait < initialDelay {
+				wait = initialDelay
+			}
+			if wait > 0 {
+				log.Printf("Performance certificate: %s renews in %s (expires_at=%d)",
+					shortHash(lc.cert.Hash), wait.Round(time.Second), lc.cert.ExpiresAt)
+				timer := time.NewTimer(wait)
+				select {
+				case <-n.ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+		if !certGenerationLoop(n.ctx, issue, initialDelay, maxDelay) {
+			return
+		}
+		issued = true
+	}
 }
 
 func (n *Node) waitForAttestationPeers() bool {
@@ -155,15 +233,15 @@ func (n *Node) certRebroadcastLoop() {
 		case <-n.ctx.Done():
 			return
 		case <-ticker.C:
-			cert := n.perfCert.Load()
-			if cert == nil {
+			lc := n.perfCert.Load()
+			if lc == nil {
 				continue
 			}
 
-			if cert.ExpiresAt <= core.Now().UnixNano() {
+			if lc.cert.ExpiresAt <= core.Now().UnixNano() {
 				continue
 			}
-			if err := n.CertGossip.Publish(n.ctx, cert); err != nil {
+			if err := n.CertGossip.Publish(n.ctx, lc.cert); err != nil {
 				log.Printf("Performance certificate: rebroadcast publish failed: %v", err)
 			}
 		}
@@ -171,14 +249,47 @@ func (n *Node) certRebroadcastLoop() {
 }
 
 func (n *Node) GetPerformanceCertificate() *perf.Certificate {
-	return n.perfCert.Load()
+	lc := n.perfCert.Load()
+	if lc == nil {
+		return nil
+	}
+	return lc.cert
 }
 
 func (n *Node) certificateByHash(hash string) *perf.Certificate {
-	if pc := n.perfCert.Load(); pc != nil && pc.Hash == hash {
-		return pc
+	if lc := n.perfCert.Load(); lc != nil && lc.cert.Hash == hash {
+		return lc.cert
 	}
 	return n.certs().get(hash)
+}
+
+func (n *Node) CertificateNonces(hash string) []uint64 {
+	lc := n.perfCert.Load()
+	if lc == nil || lc.cert.Hash != hash || lc.nonces == nil {
+		return nil
+	}
+	out := make([]uint64, len(lc.nonces))
+	copy(out, lc.nonces)
+	return out
+}
+
+type CertificateAttestations struct {
+	Start []core.TimekeeperAttestation `json:"start"`
+	End   []core.TimekeeperAttestation `json:"end"`
+}
+
+func (n *Node) CertificateAttestations(hash string) *CertificateAttestations {
+	lc := n.perfCert.Load()
+	if lc == nil || lc.cert.Hash != hash || (lc.startAtts == nil && lc.endAtts == nil) {
+		return nil
+	}
+	out := &CertificateAttestations{
+		Start: make([]core.TimekeeperAttestation, len(lc.startAtts)),
+		End:   make([]core.TimekeeperAttestation, len(lc.endAtts)),
+	}
+	copy(out.Start, lc.startAtts)
+	copy(out.End, lc.endAtts)
+	return out
 }
 
 func (n *Node) certificateInfoByHash(hash string) *core.CertificateInfo {
@@ -205,8 +316,8 @@ func (n *Node) certs() *certSet {
 func (n *Node) GetCertificateByProvider(provider string) *perf.Certificate {
 	now := core.Now().UnixNano()
 
-	if pc := n.perfCert.Load(); pc != nil && pc.Provider == provider && pc.ExpiresAt > now {
-		return pc
+	if lc := n.perfCert.Load(); lc != nil && lc.cert.Provider == provider && lc.cert.ExpiresAt > now {
+		return lc.cert
 	}
 	return n.certs().currentValid(provider, now)
 }
@@ -226,7 +337,7 @@ func (n *Node) ingestCertificate(cert *perf.Certificate) bool {
 		return false
 	}
 
-	if pc := n.perfCert.Load(); pc != nil && cert.Hash == pc.Hash {
+	if lc := n.perfCert.Load(); lc != nil && cert.Hash == lc.cert.Hash {
 		return false
 	}
 
@@ -236,6 +347,15 @@ func (n *Node) ingestCertificate(cert *perf.Certificate) bool {
 		return false
 	}
 
+	if !n.retainCertificate(cert) {
+		return false
+	}
+	log.Printf("Certificate: retained cert %s for %s (score=%.4f, expires_at=%d)",
+		shortHash(cert.Hash), shortHash(cert.Provider), cert.Score, cert.ExpiresAt)
+	return true
+}
+
+func (n *Node) retainCertificate(cert *perf.Certificate) bool {
 	added, evicted := n.certs().put(cert)
 	if !added {
 		return false
@@ -253,8 +373,6 @@ func (n *Node) ingestCertificate(cert *perf.Certificate) bool {
 			}
 		}
 	}
-	log.Printf("Certificate: retained cert %s for %s (score=%.4f, expires_at=%d)",
-		shortHash(cert.Hash), shortHash(cert.Provider), cert.Score, cert.ExpiresAt)
 	return true
 }
 
@@ -287,8 +405,34 @@ func (n *Node) loadPersistedCertificates() {
 
 func (n *Node) collectCertificates() []*perf.Certificate {
 	out := n.certs().all()
-	if pc := n.perfCert.Load(); pc != nil {
-		out = append([]*perf.Certificate{pc}, out...)
+	if lc := n.perfCert.Load(); lc != nil {
+		out = append([]*perf.Certificate{lc.cert}, out...)
 	}
 	return out
+}
+
+func (n *Node) quotableCertificate() *perf.Certificate {
+	lc := n.perfCert.Load()
+	if lc == nil || lc.cert.ExpiresAt <= core.Now().UnixNano() {
+		return nil
+	}
+	return lc.cert
+}
+
+func (n *Node) acceptCertificateHash(leaseBlock *core.Block, startTime int64) (string, error) {
+	hash := leaseBlock.CertificateHash
+	if hash == "" {
+		return "", fmt.Errorf("lease pins no performance certificate")
+	}
+	cert := n.certificateByHash(hash)
+	if cert == nil {
+		return "", fmt.Errorf("pinned certificate %s not held", shortHash(hash))
+	}
+	if cert.Provider != n.KeyPair.Address() {
+		return "", fmt.Errorf("pinned certificate %s belongs to %s", shortHash(hash), shortHash(cert.Provider))
+	}
+	if startTime > cert.ExpiresAt {
+		return "", fmt.Errorf("pinned certificate %s expired at %d, before start %d", shortHash(hash), cert.ExpiresAt, startTime)
+	}
+	return hash, nil
 }

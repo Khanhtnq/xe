@@ -18,7 +18,7 @@ const (
 	AttestationTimeout   = 10 * time.Second
 	AttestationGatherMax = 15 * time.Second
 
-	AttestationRateLimit = 30 * time.Second
+	AttestationRateLimit = 15 * time.Second
 )
 
 type AttestationRequest struct {
@@ -68,40 +68,12 @@ func (n *Node) handleAttestationRequest(from peer.ID, payload json.RawMessage) (
 		return nil, fmt.Errorf("lease_hash required")
 	}
 
-	rateKey := from.String() + ":" + req.LeaseHash
-	now := time.Now()
-	n.attRateMu.Lock()
-	for k, t := range n.attRateMap {
-		if now.Sub(t) >= AttestationRateLimit {
-			delete(n.attRateMap, k)
-		}
-	}
-	if last, ok := n.attRateMap[rateKey]; ok && now.Sub(last) < AttestationRateLimit {
-		n.attRateMu.Unlock()
-		return nil, fmt.Errorf("rate limited: retry after %v", AttestationRateLimit-now.Sub(last))
-	}
-	n.attRateMu.Unlock()
-
-	if len(req.LeaseHash) != 64 {
-		return nil, fmt.Errorf("invalid identifier length: %d", len(req.LeaseHash))
-	}
-	if err := n.canAttest(req.LeaseHash); err != nil {
-
-		logging.Warnf("Attestation request from %s rejected: %v", from.ShortString(), err)
+	att, err := n.RequestAttestation(from.String(), req.LeaseHash)
+	if err != nil {
 		return nil, err
 	}
 
-	n.attRateMu.Lock()
-	n.attRateMap[rateKey] = now
-	n.attRateMu.Unlock()
-
-	ts := core.Now().UnixNano()
-	att, err := core.SignAttestation(req.LeaseHash, ts, n.KeyPair)
-	if err != nil {
-		return nil, fmt.Errorf("sign attestation: %w", err)
-	}
-
-	logging.Debugf("Signed attestation for lease %s (ts=%d)", shortHash(req.LeaseHash), ts)
+	logging.Debugf("Signed attestation for lease %s (ts=%d)", shortHash(req.LeaseHash), att.Timestamp)
 
 	resp := AttestationResponse{Attestation: att}
 	raw, err := json.Marshal(resp)
@@ -109,6 +81,36 @@ func (n *Node) handleAttestationRequest(from peer.ID, payload json.RawMessage) (
 		return nil, fmt.Errorf("marshal response: %w", err)
 	}
 	return raw, nil
+}
+
+func (n *Node) allowAttestation(source, identifier string) error {
+	key := source + ":" + identifier
+	now := time.Now()
+
+	n.attRateMu.Lock()
+	defer n.attRateMu.Unlock()
+	if n.attRateMap == nil {
+		n.attRateMap = make(map[string]time.Time)
+	}
+
+	for k, t := range n.attRateMap {
+		if now.Sub(t) >= AttestationRateLimit {
+			delete(n.attRateMap, k)
+		}
+	}
+	if last, ok := n.attRateMap[key]; ok && now.Sub(last) < AttestationRateLimit {
+		return fmt.Errorf("rate limited: retry after %v", AttestationRateLimit-now.Sub(last))
+	}
+	return nil
+}
+
+func (n *Node) recordAttestation(source, identifier string) {
+	n.attRateMu.Lock()
+	defer n.attRateMu.Unlock()
+	if n.attRateMap == nil {
+		n.attRateMap = make(map[string]time.Time)
+	}
+	n.attRateMap[source+":"+identifier] = time.Now()
 }
 
 func (n *Node) gatherAttestations(leaseHash string, config *core.TimekeeperConfig) ([]core.TimekeeperAttestation, error) {
@@ -222,4 +224,20 @@ func (n *Node) getTimekeeperConfig() *core.TimekeeperConfig {
 		return nil
 	}
 	return &config
+}
+
+func (n *Node) acceptAttestations(leaseHash string) ([]core.TimekeeperAttestation, error) {
+	if n.acceptAttestHook != nil {
+		return n.acceptAttestHook(leaseHash)
+	}
+	tkConfig := n.getTimekeeperConfig()
+	if tkConfig == nil {
+		return nil, nil
+	}
+	attestations, err := n.gatherAttestations(leaseHash, tkConfig)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Gathered %d attestations for lease_accept %s", len(attestations), shortHash(leaseHash))
+	return attestations, nil
 }

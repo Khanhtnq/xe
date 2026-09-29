@@ -68,17 +68,21 @@ type nodeBackend interface {
 	GetChatAccounts() []string
 	GetChatContacts(account string) []string
 	SubscribeChat() (chan *chat.Envelope, func())
-	RequestAttestation(leaseHash string) (*core.TimekeeperAttestation, error)
+	RequestAttestation(source, identifier string) (*core.TimekeeperAttestation, error)
 	RegisterAccount(reg *directory.Registration) error
 	ListDirectory() []*directory.Registration
 	LookupDirectory(account string) *directory.Registration
 	GetVMs() []*vm.Info
 	GetVM(leaseHash string) *vm.Info
 	RequestAndCreateLease(ctx context.Context, vcpus, memoryMB, diskGB, duration uint64, accessPubKey string) (string, error)
+
+	RenewLease(leaseHash string, additionalSecs uint64) (*core.Block, error)
 	GetProviders() []*node.ProviderInfo
 	GetPerformanceCertificate() *perf.Certificate
 	GetCertificateByProvider(provider string) *perf.Certificate
 	GetCertificateByHash(hash string) *perf.Certificate
+	CertificateNonces(hash string) []uint64
+	CertificateAttestations(hash string) *node.CertificateAttestations
 	OpenTunnelForLease(ctx context.Context, leaseHash string) (io.ReadWriteCloser, error)
 }
 
@@ -171,6 +175,7 @@ func (h *Handler) routes() []apiRoute {
 		{"POST", "/blocks/lease_settle", "Submit a signed lease_settle block", h.handleSubmitLeaseSettle},
 		{"POST", "/blocks/lease_cancel", "Submit a signed lease_cancel block", h.handleSubmitLeaseCancel},
 		{"POST", "/blocks/lease_force_settle", "Submit a signed lease_force_settle block", h.handleSubmitLeaseForceSettle},
+		{"POST", "/blocks/lease_renew", "Submit a signed lease_renew block", h.handleSubmitLeaseRenew},
 		{"POST", "/blocks/multisig_open", "Submit a signed multisig_open block", h.handleSubmitMultisigOpen},
 		{"POST", "/blocks/multisig_update", "Submit a signed multisig_update block", h.handleSubmitMultisigUpdate},
 		{"POST", "/blocks/burn", "Submit a signed burn block (XE only)", h.handleSubmitBurn},
@@ -183,11 +188,14 @@ func (h *Handler) routes() []apiRoute {
 		{"GET", "/providers", "Compute providers and their advertised resources", h.handleGetProviders},
 		{"GET", "/certificate", "This node's perf certificate (provider mode only)", h.handleGetCertificate},
 		{"GET", "/certificate/hash/{hash}", "Retained perf certificate by hash, including expired", h.handleGetCertificateByHash},
+		{"GET", "/certificate/nonces/{hash}", "CPU-chain witness for a certificate this node issued", h.handleGetCertificateNonces},
+		{"GET", "/certificate/attestations/{hash}", "Full timekeeper attestations behind a certificate this node issued", h.handleGetCertificateAttestations},
 		{"GET", "/certificate/{provider}", "Current unexpired perf certificate for a specific provider", h.handleGetCertificateByProvider},
 
 		{"GET", "/leases", "All leases; filter by ?state=created|accepted|settled|cancelled|unfulfilled", h.handleGetLeases},
 		{"GET", "/leases/{hash}", "Lease by hash", h.handleGetLease},
 		{"POST", "/lease/request", "Request a lease; node handles signing and PoW (operator only: requires admin bearer token)", h.requireAdmin(h.handleLeaseRequest)},
+		{"POST", "/lease/{hash}/renew", "Renew (extend) an accepted lease in place", h.requireAdmin(h.handleLeaseRenew)},
 
 		{"GET", "/vms", "All running VMs", h.handleGetVMs},
 		{"GET", "/vms/{lease}", "VM info for a lease", h.handleGetVM},
@@ -620,6 +628,12 @@ func (h *Handler) handleGetAllPending(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetAllAccounts(w http.ResponseWriter, r *http.Request) {
 	offset, limit := parsePagination(r)
 	accounts := h.node.GetAllAccounts()
+	sort.Slice(accounts, func(i, j int) bool {
+		if a, b := accounts[i].Balances["XE"], accounts[j].Balances["XE"]; a != b {
+			return a > b
+		}
+		return accounts[i].Address < accounts[j].Address
+	})
 	if offset >= len(accounts) {
 		writeJSON(w, http.StatusOK, []node.AccountSummary{})
 		return
@@ -752,6 +766,10 @@ func (h *Handler) handleSubmitLeaseSettle(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) handleSubmitLeaseCancel(w http.ResponseWriter, r *http.Request) {
 	h.submitBlock(w, r, core.BlockLeaseCancel)
+}
+
+func (h *Handler) handleSubmitLeaseRenew(w http.ResponseWriter, r *http.Request) {
+	h.submitBlock(w, r, core.BlockLeaseRenew)
 }
 
 func (h *Handler) handleSubmitLeaseForceSettle(w http.ResponseWriter, r *http.Request) {
@@ -908,7 +926,8 @@ func (h *Handler) handleAttestationRequest(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "lease_hash required")
 		return
 	}
-	att, err := h.node.RequestAttestation(req.LeaseHash)
+
+	att, err := h.node.RequestAttestation(clientIP(r), req.LeaseHash)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

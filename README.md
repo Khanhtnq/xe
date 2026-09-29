@@ -30,7 +30,7 @@
 >   testnet and re-bootstrapping. Your balances, accounts and history are
 >   discarded when that happens, on purpose and without warning.
 > - **XE has no monetary value.** Testnet coins are for testing.
-> - The current network is **`testnet-0003`**.
+> - The current network is **`testnet-0005`**.
 
 ## What XE is
 
@@ -60,7 +60,7 @@ Both use 6 decimal places, and every amount on the wire is an integer count of
 
 ## What works today
 
-Honest status against the live `testnet-0003`, as of this release:
+Honest status against the live `testnet-0005`, as of this release:
 
 | Area | Status |
 |---|---|
@@ -72,31 +72,96 @@ Honest status against the live `testnet-0003`, as of this release:
 | REST API and SSE streams | ✅ works |
 | Signed p2p chat | ✅ works, end-to-end payload encryption is not done |
 | **Faucet (`xe faucet`)** | ✅ works — grants **1,000 XE** per address per rolling 24 hours, from a funded wallet. |
-| **Leasing a VM, `xe lease` / `xe ssh`** | ❌ **no providers are online** — the two testnet providers were retired, so `xe providers` returns an empty list and a lease has nobody to accept it. |
+| **Leasing a VM, `xe lease` / `xe ssh`** | Requires XUSD and an available provider; check current provider advertisements with the command below. |
 | GPU leasing | 🚧 not implemented |
 | Proof of uptime | 🚧 design stage |
 | Key rotation, dispute arbitration | 🚧 design stage |
 
-Anything marked ❌ or 🚧 is genuinely not usable today. The commands exist and
-will run — they will just fail, or wait forever for a counterparty that is not
-there.
+Areas marked 🚧 are incomplete. Provider availability changes independently of
+this release. After [building](#build), check the public node:
+
+```sh
+XE_NODE=https://ldn.core.test.network ./xe providers
+```
+
+A provider advertisement alone does not establish that lease acceptance, VM
+provisioning or SSH works end to end.
 
 ## Build
 
-You need Go — the exact toolchain is pinned in [`.go-version`](.go-version).
+Prerequisites: **Git**, **make**, **curl** and **Go 1.25 or newer**. Install a
+prebuilt Go toolchain, then use it to compile XE. If `go version` already reports
+Go 1.25 or newer, skip the Go installation steps for your OS.
+
+On macOS, Git and make are provided by the Command Line Tools; curl is included
+with macOS. Install the tools if needed:
+
+```sh
+xcode-select --install
+```
+
+Download the macOS `.pkg` from [Go downloads](https://go.dev/dl/): choose
+`darwin-arm64` for Apple Silicon or `darwin-amd64` for Intel. Run the installer,
+open a new terminal so its PATH change takes effect, and check `go version`.
+
+On Ubuntu, install Git, make and curl:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y git make curl
+```
+
+Clone the source:
 
 ```sh
 git clone https://github.com/xeprotocol/xe && cd xe
+```
+
+If Go is missing on Ubuntu, run the following from this checkout to install the
+prebuilt version in [`.go-version`](.go-version). These commands expect
+`/usr/local/go` to be absent; for replacing an existing installation, follow the
+[official installation instructions](https://go.dev/doc/install).
+
+```sh
+case "$(uname -m)" in
+  x86_64)  go_arch=amd64 ;;
+  aarch64) go_arch=arm64 ;;
+  *) echo "Use Go downloads for this architecture"; exit 1 ;;
+esac
+go_archive="go$(cat .go-version).linux-${go_arch}.tar.gz"
+go_download=$(mktemp -d)
+curl -fL "https://go.dev/dl/$go_archive" -o "$go_download/$go_archive"
+test ! -e /usr/local/go && sudo tar -C /usr/local -xzf "$go_download/$go_archive"
+export PATH="/usr/local/go/bin:$PATH"
+go version
+```
+
+Add `export PATH="/usr/local/go/bin:$PATH"` to `~/.profile` to make the Ubuntu
+PATH setting available in future login shells.
+
+On either OS, select the exact Go version for this shell and build XE. Go
+downloads that toolchain if needed; no version manager is required:
+
+```sh
+export GOTOOLCHAIN="go$(cat .go-version)"
+go version          # should match .go-version (currently go1.25.0)
 make build          # produces ./xe
 ```
 
-Builds are reproducible: pinned toolchain, `-trimpath`, `-buildvcs=false`,
-`CGO_ENABLED=0`. `make dist` cross-compiles every published platform with a
-`SHA256SUMS`; `make verify-repro` builds the same commit twice and asserts the
-binaries are byte-identical.
+`make build` uses the selected Go toolchain; `.go-version` alone does not select
+or install it. The `GOTOOLCHAIN` setting above pins this build to the release
+toolchain. All builds use `-trimpath`, `-buildvcs=false` and `CGO_ENABLED=0`.
 
-One binary does everything. `./xe --help` lists the subcommands; `xe node` runs
+Run the release and reproducibility commands on Linux; they require
+`sha256sum` and GNU `stat`, provided by Ubuntu's `coreutils` package.
+`make dist` explicitly selects the pinned toolchain and cross-compiles every
+published platform with a `SHA256SUMS`; `make verify-repro` uses the same pin to
+build the same commit twice and assert that the binaries are byte-identical.
+
+One binary does everything. `./xe --help` lists the subcommands; `./xe node` runs
 the daemon, everything else is a client that talks to a node's HTTP API.
+Run the commands below from this checkout, in the same shell. The build does
+not install `xe` on your PATH.
 
 ## Hello world
 
@@ -126,6 +191,14 @@ not the public key itself: identity and credential are separate, so a key can be
 rotated without the account changing. The seed file is the account — back it up,
 and note that anyone holding it holds the funds.
 
+Save Bob's actual `Address:` value from his wallet output for the commands
+below. Run this and paste that address at the prompt, then press Enter:
+
+```sh
+printf "Bob's address: "
+read -r BOB_ADDRESS
+```
+
 **2. Fund Alice from the faucet.** The faucet grants 1,000 XE per address per
 rolling 24 hours.
 
@@ -144,12 +217,11 @@ lands in your account without a block signed by you.
 XE_WALLET=~/.xe/alice.seed ./xe wallet balance
 ```
 
-**4. Send Bob 25 XE** — using Bob's address from step 1.
+**4. Send Bob 25 XE** using the address saved in step 1.
 
 ```sh
 XE_WALLET=~/.xe/alice.seed ./xe send \
-  4feede759012ae67f4d4636322485f04e7d995525c6ce171da2601fdbe2e2a76 \
-  25 --asset XE --memo "hello world"
+  "$BOB_ADDRESS" 25 --asset XE --memo "hello world"
 ```
 
 **5. Bob receives it.**
@@ -167,7 +239,7 @@ knows which node he listens on, Alice sends, Bob reads:
 ```sh
 XE_WALLET=~/.xe/bob.seed   ./xe directory register
 XE_WALLET=~/.xe/alice.seed ./xe chat send \
-  4feede759012ae67f4d4636322485f04e7d995525c6ce171da2601fdbe2e2a76 "hello bob"
+  "$BOB_ADDRESS" "hello bob"
 XE_WALLET=~/.xe/bob.seed   ./xe chat read
 ```
 
@@ -175,48 +247,70 @@ Registrations lapse after 30 minutes; `xe directory register --watch` stays
 resident and keeps one alive, and `xe chat read --follow --json` streams new
 messages one JSON object per line for a program on the other end.
 
-**7. Look at it from outside.** Every account is public:
+**7. Look at it from outside.** Every account is public. For Bob:
 
 ```sh
-curl -s $XE_NODE/accounts/<address>/balance
-curl -s $XE_NODE/accounts/<address>/chain
+curl -fsS "$XE_NODE/accounts/$BOB_ADDRESS/balance"
+curl -fsS "$XE_NODE/accounts/$BOB_ADDRESS/chain"
 ```
 
-Or open the explorer and wallet UI that ship inside the node itself — run
-`xe node --ui` and visit `http://127.0.0.1:8000`.
+To use the embedded explorer and wallet UI, add `--ui` to the complete node
+command in [Run a node](#run-a-node), then visit `http://127.0.0.1:8000`.
+`XE_NODE` selects the HTTP API for client commands; it does not configure a
+local node's genesis or bootstrap peers.
 
 ## Run a node
 
 Full instructions, including verifying a downloaded binary and the packaging
 (systemd unit, Dockerfile) in [`deploy/`](deploy/), are in
-[`docs/run-a-node.md`](docs/run-a-node.md). The short version, joining the live
-network:
+[`docs/run-a-node.md`](docs/run-a-node.md). The quickstart below runs a syncing
+node as your regular user on macOS or Linux.
+
+A node's network identity comes from its **genesis, not its binary**. A clean
+checkout embeds a placeholder genesis that no live network uses.
+`--genesis-dir` selects the published `ledger-genesis.json` and
+`statechain-genesis.json` for the network you want to join. Verify the bundle
+before starting the node, and compare its hashes with the table below:
+
+```sh
+./xe verify-genesis --genesis-dir ./genesis/testnet-0005 \
+  --expect-network-id testnet-0005
+```
+
+`--data` stores persistent node state and identity. The node creates the
+user-owned directory below; reuse it when restarting on the same network. After
+a testnet wipe, use the new genesis bundle and a separate data directory for
+that network. System-wide paths such as `/var/lib/xe/data` require administrator
+ownership setup, covered in the [service installation guide](deploy/README.md).
+
+Start the node after verification succeeds:
 
 ```sh
 ./xe node \
-  --data /var/lib/xe/data \
-  --genesis-dir ./genesis/testnet-0003 \
+  --data "$HOME/.xe/testnet-0005" \
+  --genesis-dir ./genesis/testnet-0005 \
   --dial /ip4/45.77.226.208/tcp/9000/p2p/12D3KooWJg4PQYGSfNCupBWZdEWbKj7pgdp5MmmUXbPdBcp6YDtT,/ip4/144.202.4.117/tcp/9000/p2p/12D3KooWEqv1BRZkSntgcgbrJh7bobFRSkBdRupubvNZLEx8hZLA \
   --port 9000 --api --api-port 8080
 ```
 
-A node's identity is its **genesis, not its binary**. A binary built from a
-clean checkout embeds a placeholder genesis that no live network uses, which is
-why `--genesis-dir` exists. Confirm what you are about to join before you join
-it:
+Keep it running and, from another terminal, check the local node:
 
 ```sh
-./xe verify-genesis --genesis-dir ./genesis/testnet-0003
+curl -fsS http://127.0.0.1:8080/node
 ```
 
-### Network parameters — `testnet-0003`
+Confirm `network_id` is `testnet-0005` and `peer_count` becomes greater than
+zero. The API listens on loopback by default; adding `--ui` also serves the
+explorer and wallet at `http://127.0.0.1:8000`.
+
+### Network parameters — `testnet-0005`
 
 | Parameter | Value |
 |---|---|
-| `network_id` | `testnet-0003` |
-| ledger genesis hash | `946597b85290426dfab812778387b93b2b3a41291ebceaac02ca0bbb0e3791ab` |
-| statechain genesis hash | `5ea4cf0ee4c919c54af9476a93fe748fe87babf1432a8a53393d2f73cc6873e9` |
-| genesis bundle | [`genesis/testnet-0003/`](genesis/testnet-0003) |
+| `network_id` | `testnet-0005` |
+| ledger genesis hash | `3ff640410d7879821b544d09545dcfb8e96fe4fc717634e8bff4e53cacd1e150` |
+| statechain genesis hash | `d01aabc1a29dc64bc6bbc30031a716cd2e0ceb867e5479953cd5ad22c8f296d6` |
+| genesis bundle | [`genesis/testnet-0005/`](genesis/testnet-0005) |
 | bootstrap (London) | `/ip4/45.77.226.208/tcp/9000/p2p/12D3KooWJg4PQYGSfNCupBWZdEWbKj7pgdp5MmmUXbPdBcp6YDtT` |
 | bootstrap (Frankfurt) | `/ip4/192.248.176.245/tcp/9000/p2p/12D3KooWEbQ5zDvSz6kKE5ppzwBXKRFsnZbHNjRx94QZFaPeGA4e` |
 | bootstrap (New York) | `/ip4/144.202.4.117/tcp/9000/p2p/12D3KooWEqv1BRZkSntgcgbrJh7bobFRSkBdRupubvNZLEx8hZLA` |

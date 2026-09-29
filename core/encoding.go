@@ -23,6 +23,7 @@ const (
 	typeByteBurn             = byte(0x0B)
 	typeByteLeaseForceSettle = byte(0x0C)
 	typeByteMint             = byte(0x0D)
+	typeByteLeaseRenew       = byte(0x0E)
 
 	assetFieldSize      = 8
 	fixedHeaderSize     = 90
@@ -66,6 +67,8 @@ func MarshalBlockCanonical(b *Block) ([]byte, error) {
 		typeByte = typeByteBurn
 	case BlockMint:
 		typeByte = typeByteMint
+	case BlockLeaseRenew:
+		typeByte = typeByteLeaseRenew
 	default:
 		return nil, fmt.Errorf("MarshalBlock: unknown block type %q", b.Type)
 	}
@@ -222,6 +225,26 @@ func MarshalBlockCanonical(b *Block) ([]byte, error) {
 			buf.Write(locked[:])
 		}
 
+	case BlockLeaseRenew:
+
+		source, err := hex.DecodeString(b.Source)
+		if err != nil {
+			return nil, fmt.Errorf("MarshalBlock: invalid source hex: %w", err)
+		}
+		if len(source) != 32 {
+			return nil, fmt.Errorf("MarshalBlock: source must be 32 bytes, got %d", len(source))
+		}
+		buf.Write(source)
+		var tail [32]byte
+		binary.BigEndian.PutUint64(tail[0:8], b.Amount)
+		binary.BigEndian.PutUint64(tail[8:16], b.Duration)
+		buf.Write(tail[:16])
+		var locked [24]byte
+		binary.BigEndian.PutUint64(locked[0:8], b.LockedR)
+		binary.BigEndian.PutUint64(locked[8:16], b.LockedPayoutCap)
+		binary.BigEndian.PutUint64(locked[16:24], b.LockedTWAP)
+		buf.Write(locked[:])
+
 	case BlockBurn:
 		var amount [8]byte
 		binary.BigEndian.PutUint64(amount[:], b.Amount)
@@ -284,7 +307,7 @@ func MarshalBlockAux(b *Block) []byte {
 	}
 
 	switch b.Type {
-	case BlockLease, BlockLeaseAccept, BlockLeaseSettle, BlockLeaseForceSettle:
+	case BlockLease, BlockLeaseAccept, BlockLeaseSettle, BlockLeaseForceSettle, BlockLeaseRenew:
 	default:
 		if buf.Len() == 0 {
 			return nil

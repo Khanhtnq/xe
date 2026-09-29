@@ -206,6 +206,16 @@ func (m *MemStore) applyUndoLocked(u *core.BlockUndo) error {
 		m.frontiers[u.Account] = u.FrontierHash
 	}
 
+	if u.ReducePendingID != "" {
+		if ps, ok := m.pending[u.ReducePendingID]; ok {
+			ps.Amount -= u.ReducePendingAmount
+			if destMap := m.pendingByDest[ps.Destination]; destMap != nil {
+				if dps, ok := destMap[u.ReducePendingID]; ok {
+					dps.Amount -= u.ReducePendingAmount
+				}
+			}
+		}
+	}
 	if u.DeletePendingID != "" {
 		if ps, ok := m.pending[u.DeletePendingID]; ok {
 			dest := ps.Destination
@@ -286,6 +296,11 @@ func (m *MemStore) applyCommitLocked(c *core.BlockCommit) error {
 			return fmt.Errorf("CommitBlock: %w: lease %s is %s, want %s",
 				core.ErrLeaseStateConflict, c.ExpectLeaseHash[:12], lease.State, c.ExpectLeaseState)
 		}
+
+		if c.ExpectLeaseEffectiveDurationSecs != 0 && lease.EffectiveDurationSecs() != c.ExpectLeaseEffectiveDurationSecs {
+			return fmt.Errorf("CommitBlock: %w: lease %s effective duration %d, want %d",
+				core.ErrLeaseStateConflict, c.ExpectLeaseHash[:12], lease.EffectiveDurationSecs(), c.ExpectLeaseEffectiveDurationSecs)
+		}
 	}
 
 	m.blocks[c.Block.Hash] = copyBlock(c.Block)
@@ -315,6 +330,17 @@ func (m *MemStore) applyCommitLocked(c *core.BlockCommit) error {
 				delete(destMap, c.DeletePendingID)
 				if len(destMap) == 0 {
 					delete(m.pendingByDest, dest)
+				}
+			}
+		}
+	}
+
+	if c.TopUpPendingID != "" {
+		if ps, ok := m.pending[c.TopUpPendingID]; ok {
+			ps.Amount += c.TopUpPendingAmount
+			if destMap := m.pendingByDest[ps.Destination]; destMap != nil {
+				if dps, ok := destMap[c.TopUpPendingID]; ok {
+					dps.Amount += c.TopUpPendingAmount
 				}
 			}
 		}
@@ -387,6 +413,10 @@ func (m *MemStore) CommitCascade(undos []*core.BlockUndo, commit *core.BlockComm
 		if lease.State != commit.ExpectLeaseState {
 			return fmt.Errorf("CommitCascade: %d undo(s) + winner: %w: lease %s is %s, want %s",
 				len(undos), core.ErrLeaseStateConflict, commit.ExpectLeaseHash[:12], lease.State, commit.ExpectLeaseState)
+		}
+		if commit.ExpectLeaseEffectiveDurationSecs != 0 && lease.EffectiveDurationSecs() != commit.ExpectLeaseEffectiveDurationSecs {
+			return fmt.Errorf("CommitCascade: %d undo(s) + winner: %w: lease %s effective duration %d, want %d",
+				len(undos), core.ErrLeaseStateConflict, commit.ExpectLeaseHash[:12], lease.EffectiveDurationSecs(), commit.ExpectLeaseEffectiveDurationSecs)
 		}
 	}
 

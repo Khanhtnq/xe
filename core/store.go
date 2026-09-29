@@ -106,6 +106,11 @@ type BlockCommit struct {
 	ExpectLeaseState LeaseState
 
 	AssetCredit *AssetDelta
+
+	TopUpPendingID     string
+	TopUpPendingAmount uint64
+
+	ExpectLeaseEffectiveDurationSecs uint64
 }
 
 type AssetDelta struct {
@@ -142,4 +147,7 @@ type BlockUndo struct {
 	DeleteAccountKeyAccount string
 
 	AssetDebit *AssetDelta
+
+	ReducePendingID     string
+	ReducePendingAmount uint64
 }

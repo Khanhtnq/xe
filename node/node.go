@@ -29,7 +29,6 @@ import (
 	"github.com/xeprotocol/xe/logging"
 	"github.com/xeprotocol/xe/metrics"
 	xenet "github.com/xeprotocol/xe/net"
-	"github.com/xeprotocol/xe/perf"
 	"github.com/xeprotocol/xe/statechain"
 	"github.com/xeprotocol/xe/store"
 	"github.com/xeprotocol/xe/vm"
@@ -64,7 +63,7 @@ type Node struct {
 	providerPriceMultMilli uint64
 	acceptPolicy           LeaseAcceptPolicy
 	VMManager              vm.Manager
-	perfCert               atomic.Pointer[perf.Certificate]
+	perfCert               atomic.Pointer[localCertificate]
 	CertGossip             *xenet.CertificateGossip
 	certCache              *certSet
 	certsOnce              sync.Once
@@ -85,6 +84,8 @@ type Node struct {
 	tunnelRegistry   *xenet.TunnelRegistry
 	acceptInFlight   map[string]struct{}
 	acceptInFlightMu sync.Mutex
+	acceptAttestHook func(leaseHash string) ([]core.TimekeeperAttestation, error)
+	acceptSched      acceptSchedule
 	pullSem          chan struct{}
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -518,21 +519,27 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 			return nil, fmt.Errorf("provider mode requires sys.timekeepers in state chain — cannot start without trusted timekeepers")
 		}
 
-		if f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0); err != nil {
-			cancel()
-			return nil, fmt.Errorf("provider mode requires /dev/kvm access — add the service user to the kvm group or set SupplementaryGroups=kvm in the systemd unit: %w", err)
+		if os.Getenv("XE_VM_MOCK") == "1" {
+			n.VMManager = vm.NewMockManager()
+			n.tunnelRegistry = xenet.NewTunnelRegistry()
+			log.Printf("Provider mode (MOCK VM — XE_VM_MOCK=1, test only): %d vCPUs, %d MB memory, %d GB disk", n.providerVCPUs, n.providerMemoryMB, n.providerDiskGB)
 		} else {
-			_ = f.Close()
-		}
+			if f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0); err != nil {
+				cancel()
+				return nil, fmt.Errorf("provider mode requires /dev/kvm access — add the service user to the kvm group or set SupplementaryGroups=kvm in the systemd unit: %w", err)
+			} else {
+				_ = f.Close()
+			}
 
-		vmm, err := vm.NewLimaManager(cfg.DataDir, cfg.LimactlPath)
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("lima manager: %w", err)
+			vmm, err := vm.NewLimaManager(cfg.DataDir, cfg.LimactlPath)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("lima manager: %w", err)
+			}
+			n.VMManager = vmm
+			n.tunnelRegistry = xenet.NewTunnelRegistry()
+			log.Printf("Provider mode (lima): %d vCPUs, %d MB memory, %d GB disk", n.providerVCPUs, n.providerMemoryMB, n.providerDiskGB)
 		}
-		n.VMManager = vmm
-		n.tunnelRegistry = xenet.NewTunnelRegistry()
-		log.Printf("Provider mode (lima): %d vCPUs, %d MB memory, %d GB disk", n.providerVCPUs, n.providerMemoryMB, n.providerDiskGB)
 		if !n.acceptPolicy.IsZero() {
 			log.Printf("Provider auto-accept policy: duration=[%ds, %ds] cost=[%d, %d] XUSD max_concurrent=%d (0=unset)",
 				n.acceptPolicy.MinDurationSec, n.acceptPolicy.MaxDurationSec,
@@ -547,7 +554,7 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 			if !n.waitForAttestationPeers() {
 				return
 			}
-			certGenerationLoop(n.ctx, n.generatePerformanceCertificate, certRetryInitialDelay, certRetryMaxDelay)
+			n.maintainCertificate(n.generatePerformanceCertificate, certRetryInitialDelay, certRetryMaxDelay)
 		}()
 
 		n.wg.Add(1)
@@ -1343,12 +1350,12 @@ func (n *Node) handleMarketplace(msgs <-chan *xenet.MarketplaceMsg) {
 			}
 			xusdBal := n.Ledger.GetAssetBalances(n.KeyPair.Address())["XUSD"]
 
-			pc := n.perfCert.Load()
-			if pc == nil {
+			cert := n.quotableCertificate()
+			if cert == nil {
 				log.Printf("Skipping request %s: no active certificate", shortHash(req.RequestID))
 				continue
 			}
-			totalCost, err := core.LeaseCost(req.VCPUs, req.MemoryMB, req.DiskGB, req.Duration, pc.PriceMultiplierMilli)
+			totalCost, err := core.LeaseCost(req.VCPUs, req.MemoryMB, req.DiskGB, req.Duration, cert.PriceMultiplierMilli)
 			if err != nil {
 				log.Printf("Offer cost overflow for request %s: %v", shortHash(req.RequestID), err)
 				continue
@@ -1367,7 +1374,7 @@ func (n *Node) handleMarketplace(msgs <-chan *xenet.MarketplaceMsg) {
 				DiskGB:          req.DiskGB,
 				Duration:        req.Duration,
 				TotalCost:       totalCost,
-				CertificateHash: pc.Hash,
+				CertificateHash: cert.Hash,
 				Timestamp:       core.Now().UnixNano(),
 			}
 			xenet.SignOffer(offer, n.KeyPair.Private)
@@ -1455,6 +1462,8 @@ func (n *Node) autoAcceptLease(leaseBlock *core.Block) {
 		return
 	}
 	defer n.endAccept(leaseBlock.Hash)
+	retry := false
+	defer func() { n.acceptSched.record(leaseBlock.Hash, retry, time.Now()) }()
 	if leaseAlreadyAccepted(n.GetLease(leaseBlock.Hash)) {
 		return
 	}
@@ -1478,15 +1487,23 @@ func (n *Node) autoAcceptLease(leaseBlock *core.Block) {
 		return
 	}
 
-	var attestations []core.TimekeeperAttestation
+	attestations, err := n.acceptAttestations(leaseBlock.Hash)
+	if err != nil {
+		log.Printf("Failed to gather attestations for lease_accept %s: %v", shortHash(leaseBlock.Hash), err)
+		retry = true
+		return
+	}
+
+	startTime := core.Now().UnixNano()
 	if tkConfig := n.getTimekeeperConfig(); tkConfig != nil {
-		var err error
-		attestations, err = n.gatherAttestations(leaseBlock.Hash, tkConfig)
-		if err != nil {
-			log.Printf("Failed to gather attestations for lease_accept %s: %v", shortHash(leaseBlock.Hash), err)
-			return
+		if median, err := core.ValidateAttestations(attestations, leaseBlock.Hash, tkConfig, false); err == nil {
+			startTime = median
 		}
-		log.Printf("Gathered %d attestations for lease_accept %s", len(attestations), shortHash(leaseBlock.Hash))
+	}
+	certHash, err := n.acceptCertificateHash(leaseBlock, startTime)
+	if err != nil {
+		log.Printf("Cannot auto-accept lease %s: %v", shortHash(leaseBlock.Hash), err)
+		return
 	}
 
 	n.blockCreateMu.Lock()
@@ -1567,17 +1584,7 @@ func (n *Node) autoAcceptLease(leaseBlock *core.Block) {
 		return
 	}
 
-	var certHash string
-	if pc := n.perfCert.Load(); pc != nil {
-		certHash = pc.Hash
-	}
-	if certHash == "" {
-		n.blockCreateMu.Unlock()
-		log.Printf("Lease %s: no performance certificate, cannot accept", shortHash(leaseBlock.Hash))
-		n.teardownVM(&core.Lease{LeaseHash: leaseBlock.Hash})
-		return
-	}
-
+	locked := acceptLockedEmission(n.Ledger, startTime)
 	b := &core.Block{
 		Type:            core.BlockLeaseAccept,
 		Account:         myAddr,
@@ -1590,9 +1597,9 @@ func (n *Node) autoAcceptLease(leaseBlock *core.Block) {
 		Attestations:    attestations,
 		CertificateHash: certHash,
 
-		LockedR:         n.Ledger.CurrentR(),
-		LockedPayoutCap: n.Ledger.CurrentPayoutCap(),
-		LockedTWAP:      n.Ledger.CurrentTWAP(),
+		LockedR:         locked.R,
+		LockedPayoutCap: locked.PayoutCap,
+		LockedTWAP:      locked.TWAP,
 	}
 	if err := core.SignBlock(b, n.KeyPair); err != nil {
 		n.blockCreateMu.Unlock()
@@ -1607,6 +1614,7 @@ func (n *Node) autoAcceptLease(leaseBlock *core.Block) {
 		log.Printf("Failed to add lease_accept: %v", err)
 		if shouldTeardownOnAcceptFailure(n.GetLease(leaseBlock.Hash), myAddr) {
 			n.teardownVM(&core.Lease{LeaseHash: leaseBlock.Hash})
+			retry = core.IsRetryableError(err)
 		} else {
 			log.Printf("Lease %s: our accept already stands on-chain, keeping VM", shortHash(leaseBlock.Hash))
 		}
@@ -1622,41 +1630,126 @@ func (n *Node) autoAcceptLease(leaseBlock *core.Block) {
 	log.Printf("Auto-accepted lease %s (stake=%d XUSD)", shortHash(leaseBlock.Hash), stake)
 }
 
+var (
+	acceptRetryQuick = 5 * time.Second
+	acceptRetryBase  = AttestationRateLimit + 5*time.Second
+	acceptRetryMax   = 160 * time.Second
+)
+
+func acceptRetryDelay(failures int) time.Duration {
+	if failures == 0 {
+		return acceptRetryQuick
+	}
+	delay := acceptRetryBase
+	for i := 1; i < failures && delay < acceptRetryMax; i++ {
+		delay *= 2
+	}
+	return min(delay, acceptRetryMax)
+}
+
+func acceptLockedEmission(l *core.Ledger, startTime int64) core.EpochParams {
+	if ep, ok := l.EpochParamsAt(startTime); ok {
+		return ep
+	}
+	return core.EpochParams{R: l.CurrentR(), PayoutCap: l.CurrentPayoutCap(), TWAP: l.CurrentTWAP()}
+}
+
 func (n *Node) leaseWatchLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	accepted := make(map[string]bool)
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
-		case <-ticker.C:
-			myAddr := n.KeyPair.Address()
-			pending := n.Ledger.GetPendingForAccount(myAddr)
-			for _, p := range pending {
-				if accepted[p.SendHash] {
-					continue
-				}
-				leaseBlock := n.Ledger.GetBlock(p.SendHash)
-				if leaseBlock == nil || leaseBlock.Type != core.BlockLease {
-					continue
-				}
-				if leaseBlock.Destination != myAddr {
-					continue
-				}
+		case now := <-ticker.C:
+			n.leaseWatchTick(now, &n.wg)
+		}
+	}
+}
 
-				if leaseAlreadyAccepted(n.GetLease(leaseBlock.Hash)) {
-					accepted[leaseBlock.Hash] = true
-					continue
-				}
-				accepted[leaseBlock.Hash] = true
-				log.Printf("Lease watch: found unaccepted lease %s, auto-accepting", shortHash(leaseBlock.Hash))
-				n.wg.Add(1)
-				go func() {
-					defer n.wg.Done()
-					n.autoAcceptLease(leaseBlock)
-				}()
-			}
+func (n *Node) leaseWatchTick(now time.Time, wg *sync.WaitGroup) {
+	myAddr := n.KeyPair.Address()
+	pending := n.Ledger.GetPendingForAccount(myAddr)
+	live := make(map[string]bool, len(pending))
+	for _, p := range pending {
+		live[p.SendHash] = true
+		if !n.acceptSched.due(p.SendHash, now) || n.acceptRunning(p.SendHash) {
+			continue
+		}
+		leaseBlock := n.Ledger.GetBlock(p.SendHash)
+		if leaseBlock == nil || leaseBlock.Type != core.BlockLease {
+			continue
+		}
+		if leaseBlock.Destination != myAddr {
+			continue
+		}
+
+		if leaseAlreadyAccepted(n.GetLease(leaseBlock.Hash)) {
+			n.acceptSched.record(leaseBlock.Hash, false, now)
+			continue
+		}
+		log.Printf("Lease watch: found unaccepted lease %s, auto-accepting", shortHash(leaseBlock.Hash))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n.autoAcceptLease(leaseBlock)
+		}()
+	}
+	n.acceptSched.prune(live)
+}
+
+func (n *Node) acceptRunning(leaseHash string) bool {
+	n.acceptInFlightMu.Lock()
+	defer n.acceptInFlightMu.Unlock()
+	_, busy := n.acceptInFlight[leaseHash]
+	return busy
+}
+
+type acceptSchedule struct {
+	mu     sync.Mutex
+	leases map[string]*acceptRetryState
+}
+
+type acceptRetryState struct {
+	done     bool
+	failures int
+	next     time.Time
+}
+
+func (s *acceptSchedule) due(leaseHash string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.leases[leaseHash]
+	return !ok || (!st.done && !now.Before(st.next))
+}
+
+func (s *acceptSchedule) record(leaseHash string, retry bool, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leases == nil {
+		s.leases = make(map[string]*acceptRetryState)
+	}
+	st, ok := s.leases[leaseHash]
+	if !ok {
+		st = &acceptRetryState{}
+		s.leases[leaseHash] = st
+	}
+	if !retry {
+		st.done = true
+		return
+	}
+	delay := acceptRetryDelay(st.failures)
+	st.failures++
+	st.next = now.Add(delay)
+	log.Printf("Lease %s: retrying accept in %v", shortHash(leaseHash), delay)
+}
+
+func (s *acceptSchedule) prune(live map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h := range s.leases {
+		if !live[h] {
+			delete(s.leases, h)
 		}
 	}
 }
@@ -1716,7 +1809,8 @@ func (n *Node) trySettleExpiredLeases() {
 		if lease.Settled || lease.State != core.LeaseAccepted {
 			continue
 		}
-		expiry := lease.StartTime + int64(lease.Duration)*1e9
+
+		expiry := lease.EffectiveExpiry()
 		if now < expiry {
 			continue
 		}
@@ -1735,7 +1829,7 @@ func consumerShouldForceSettle(lease *core.Lease, myAddr string, now int64) bool
 	if lease.Settled || lease.State != core.LeaseAccepted {
 		return false
 	}
-	expiry := lease.StartTime + int64(lease.Duration)*1e9
+	expiry := lease.EffectiveExpiry()
 	return now >= expiry+core.LeaseSettleGrace+core.LeaseForceSettleGap
 }
 
@@ -1762,7 +1856,7 @@ func shouldArchiveExpiredLease(lease *core.Lease, now int64) bool {
 	if lease == nil || lease.Settled || lease.State != core.LeaseAccepted {
 		return false
 	}
-	expiry := lease.StartTime + int64(lease.Duration)*1e9
+	expiry := lease.EffectiveExpiry()
 	return now >= expiry+core.LeaseEscrowExpiry+core.LeaseArchiveGap
 }
 
@@ -1862,7 +1956,13 @@ func (n *Node) forceSettleLease(lease *core.Lease) {
 }
 
 func (n *Node) leaseSettleAmount(lease *core.Lease) uint64 {
-	return core.LeaseEmission(lease.Cost, core.CapR(lease.LockedR, lease.LockedPayoutCap, lease.LockedTWAP))
+
+	amount, err := core.LeaseTotalEmission(lease)
+	if err != nil {
+		log.Printf("lease_settle: emission overflow for %s: %v", shortHash(lease.LeaseHash), err)
+		return 0
+	}
+	return amount
 }
 
 func (n *Node) settleLease(lease *core.Lease) {
@@ -2115,14 +2215,21 @@ func (n *Node) OpenTunnelForLease(ctx context.Context, leaseHash string) (io.Rea
 	return xenet.OpenTunnel(ctx, n.Host, n.DHT, providerPeer, leaseHash)
 }
 
-func (n *Node) RequestAttestation(identifier string) (*core.TimekeeperAttestation, error) {
+func (n *Node) RequestAttestation(source, identifier string) (*core.TimekeeperAttestation, error) {
 
 	if len(identifier) != 64 {
 		return nil, fmt.Errorf("invalid attestation identifier length: %d", len(identifier))
 	}
-	if err := n.canAttest(identifier); err != nil {
+	if err := n.allowAttestation(source, identifier); err != nil {
 		return nil, err
 	}
+	if err := n.canAttest(identifier); err != nil {
+
+		logging.Warnf("Attestation request from %s rejected: %v", source, err)
+		return nil, err
+	}
+
+	n.recordAttestation(source, identifier)
 	ts := core.Now().UnixNano()
 	return core.SignAttestation(identifier, ts, n.KeyPair)
 }

@@ -670,6 +670,34 @@ func (s *BadgerStore) CommitBlock(c *core.BlockCommit) error {
 	})
 }
 
+func addToPendingAmountTxn(txn *badger.Txn, sendHash string, delta int64) error {
+	pendingKey := prefixedKey(prefixPending, sendHash)
+	item, err := txn.Get(pendingKey)
+	if err == badger.ErrKeyNotFound {
+		return fmt.Errorf("addToPendingAmount: pending %s not found", shortStr(sendHash))
+	}
+	if err != nil {
+		return err
+	}
+	var ps core.PendingSend
+	if err := item.Value(func(val []byte) error { return json.Unmarshal(val, &ps) }); err != nil {
+		return err
+	}
+	if delta < 0 && uint64(-delta) > ps.Amount {
+		return fmt.Errorf("addToPendingAmount: pending %s underflow (amount %d, delta %d)", shortStr(sendHash), ps.Amount, delta)
+	}
+	if delta < 0 {
+		ps.Amount -= uint64(-delta)
+	} else {
+		ps.Amount += uint64(delta)
+	}
+	psData, err := json.Marshal(&ps)
+	if err != nil {
+		return err
+	}
+	return txn.Set(pendingKey, psData)
+}
+
 func applyCommitTxn(txn *badger.Txn, c *core.BlockCommit) error {
 	blockData, err := json.Marshal(c.Block)
 	if err != nil {
@@ -703,6 +731,11 @@ func applyCommitTxn(txn *badger.Txn, c *core.BlockCommit) error {
 			if lease.State != c.ExpectLeaseState {
 				return fmt.Errorf("CommitBlock: %w: lease %s is %s, want %s",
 					core.ErrLeaseStateConflict, c.ExpectLeaseHash[:12], lease.State, c.ExpectLeaseState)
+			}
+
+			if c.ExpectLeaseEffectiveDurationSecs != 0 && lease.EffectiveDurationSecs() != c.ExpectLeaseEffectiveDurationSecs {
+				return fmt.Errorf("CommitBlock: %w: lease %s effective duration %d, want %d",
+					core.ErrLeaseStateConflict, c.ExpectLeaseHash[:12], lease.EffectiveDurationSecs(), c.ExpectLeaseEffectiveDurationSecs)
 			}
 		}
 
@@ -830,6 +863,12 @@ func applyCommitTxn(txn *badger.Txn, c *core.BlockCommit) error {
 			}
 		}
 
+		if c.TopUpPendingID != "" {
+			if err := addToPendingAmountTxn(txn, c.TopUpPendingID, int64(c.TopUpPendingAmount)); err != nil {
+				return err
+			}
+		}
+
 		if c.DeletePendingID != "" {
 			pendingKey := prefixedKey(prefixPending, c.DeletePendingID)
 			item, err := txn.Get(pendingKey)
@@ -943,6 +982,12 @@ func applyUndoTxn(txn *badger.Txn, u *core.BlockUndo) error {
 			}
 
 			if err := txn.Set(prefixedKey(prefixFrontier, u.Account), []byte(u.FrontierHash)); err != nil {
+				return err
+			}
+		}
+
+		if u.ReducePendingID != "" {
+			if err := addToPendingAmountTxn(txn, u.ReducePendingID, -int64(u.ReducePendingAmount)); err != nil {
 				return err
 			}
 		}

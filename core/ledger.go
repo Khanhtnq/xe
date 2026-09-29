@@ -744,7 +744,7 @@ func (l *Ledger) addBlock(b *Block, skipTimestamp bool) error {
 	b = &bc
 	normalizeBlockHex(b)
 
-	if b.Type != BlockLeaseAccept && b.Type != BlockLeaseSettle && b.Type != BlockLeaseForceSettle {
+	if b.Type != BlockLeaseAccept && b.Type != BlockLeaseSettle && b.Type != BlockLeaseForceSettle && b.Type != BlockLeaseRenew {
 		b.Attestations = nil
 	}
 
@@ -937,6 +937,8 @@ func (l *Ledger) dispatchValidateAndAdd(b *Block, skipTimestamp bool) error {
 		return l.validateAndAddLeaseCancel(b)
 	case BlockLeaseForceSettle:
 		return l.validateAndAddLeaseForceSettle(b, skipTimestamp)
+	case BlockLeaseRenew:
+		return l.validateAndAddLeaseRenew(b, skipTimestamp)
 	case BlockMultisigOpen:
 		return l.validateAndAddMultisigOpen(b)
 	case BlockMultisigUpdate:
@@ -1705,32 +1707,8 @@ func (l *Ledger) validateAndAddLeaseAccept(b *Block, skipSkew bool) error {
 	if lockedR == 0 {
 		return fmt.Errorf("lease_accept missing locked emission params: locked_r must be set (the accept must carry locked_r/locked_payout_cap/locked_twap)")
 	}
-	if l.epochAtFn != nil {
-
-		candidates := l.epochAtFn(startTime)
-		if len(candidates) == 0 {
-
-			return fmt.Errorf("lease_accept epoch not yet available for accept time %d: retry after statechain syncs", startTime)
-		}
-		matched := false
-		for i := range candidates {
-			e := &candidates[i]
-			if lockedR == e.R && lockedCap == e.PayoutCap && lockedTWAP == e.TWAP {
-				matched = true
-				break
-			}
-		}
-
-		if !matched {
-			cur := candidates[0]
-			if skipSkew {
-
-				return fmt.Errorf("lease_accept locked emission mismatch on sync: block (R=%d cap=%d twap=%d) != epoch@accept (R=%d cap=%d twap=%d): retry after statechain syncs",
-					lockedR, lockedCap, lockedTWAP, cur.R, cur.PayoutCap, cur.TWAP)
-			}
-			return fmt.Errorf("lease_accept locked emission mismatch: block (R=%d cap=%d twap=%d) != epoch@accept (R=%d cap=%d twap=%d)",
-				lockedR, lockedCap, lockedTWAP, cur.R, cur.PayoutCap, cur.TWAP)
-		}
+	if err := l.validateLockedEmissionAt(startTime, lockedR, lockedCap, lockedTWAP, skipSkew, "lease_accept"); err != nil {
+		return err
 	}
 
 	commit.ExpectLeaseHash = b.Source
@@ -1952,7 +1930,8 @@ func (l *Ledger) validateAndAddLeaseForceSettle(b *Block, skipSkew bool) error {
 	if err != nil {
 		return fmt.Errorf("lease_force_settle attestation: %w", err)
 	}
-	expiry := lease.StartTime + int64(lease.Duration)*1e9
+
+	expiry := lease.EffectiveExpiry()
 	eligibleAt := expiry + LeaseSettleGrace + LeaseForceSettleGap
 	if forceTime < eligibleAt {
 		return fmt.Errorf("lease not yet force-settleable: need timestamp >= %d, got %d", eligibleAt, forceTime)
@@ -1988,7 +1967,7 @@ func (l *Ledger) validateAndAddLeaseForceSettle(b *Block, skipSkew bool) error {
 	}
 
 	oldBal := l.getAssetBalanceOverlay(b.Account, "XUSD")
-	expectedBal := oldBal + leaseBlock.Amount
+	expectedBal := oldBal + pending.Amount
 	if expectedBal < oldBal {
 		return fmt.Errorf("lease_force_settle would overflow uint64 balance")
 	}
@@ -2005,6 +1984,8 @@ func (l *Ledger) validateAndAddLeaseForceSettle(b *Block, skipSkew bool) error {
 
 	commit.ExpectLeaseHash = b.Source
 	commit.ExpectLeaseState = LeaseAccepted
+
+	commit.ExpectLeaseEffectiveDurationSecs = lease.EffectiveDurationSecs()
 	if err := l.commitBlockWrite(commit, prevBalance); err != nil {
 		return err
 	}
@@ -2042,6 +2023,17 @@ func (l *Ledger) CurrentTWAP() uint64 {
 	return l.epochTWAPFn()
 }
 
+func (l *Ledger) EpochParamsAt(ns int64) (EpochParams, bool) {
+	if l.epochAtFn == nil {
+		return EpochParams{}, false
+	}
+	candidates := l.epochAtFn(ns)
+	if len(candidates) == 0 {
+		return EpochParams{}, false
+	}
+	return candidates[0], true
+}
+
 func CapR(r, payoutCap, twapMilliUSD uint64) uint64 {
 	if payoutCap == 0 || twapMilliUSD == 0 {
 		return r
@@ -2073,6 +2065,49 @@ func LeaseEmissionChecked(cost, r uint64) (uint64, error) {
 func LeaseEmission(cost, r uint64) uint64 {
 	emission, _ := LeaseEmissionChecked(cost, r)
 	return emission
+}
+
+func LeaseTotalEmission(lease *Lease) (uint64, error) {
+	total, err := LeaseEmissionChecked(lease.Cost, CapR(lease.LockedR, lease.LockedPayoutCap, lease.LockedTWAP))
+	if err != nil {
+		return 0, fmt.Errorf("base segment: %w", err)
+	}
+	for i := range lease.Renewals {
+		seg := &lease.Renewals[i]
+		segXE, err := LeaseEmissionChecked(seg.Cost, CapR(seg.LockedR, seg.LockedPayoutCap, seg.LockedTWAP))
+		if err != nil {
+			return 0, fmt.Errorf("renewal %d: %w", i, err)
+		}
+		sum, ok := safeAdd(total, segXE)
+		if !ok {
+			return 0, fmt.Errorf("lease emission overflow summing renewal %d", i)
+		}
+		total = sum
+	}
+	return total, nil
+}
+
+func (l *Ledger) validateLockedEmissionAt(atTime int64, lockedR, lockedCap, lockedTWAP uint64, skipSkew bool, opName string) error {
+	if l.epochAtFn == nil {
+		return nil
+	}
+	candidates := l.epochAtFn(atTime)
+	if len(candidates) == 0 {
+		return fmt.Errorf("%s epoch not yet available for time %d: retry after statechain syncs", opName, atTime)
+	}
+	for i := range candidates {
+		e := &candidates[i]
+		if lockedR == e.R && lockedCap == e.PayoutCap && lockedTWAP == e.TWAP {
+			return nil
+		}
+	}
+	cur := candidates[0]
+	if skipSkew {
+		return fmt.Errorf("%s locked emission mismatch on sync: block (R=%d cap=%d twap=%d) != epoch@time (R=%d cap=%d twap=%d): retry after statechain syncs",
+			opName, lockedR, lockedCap, lockedTWAP, cur.R, cur.PayoutCap, cur.TWAP)
+	}
+	return fmt.Errorf("%s locked emission mismatch: block (R=%d cap=%d twap=%d) != epoch@time (R=%d cap=%d twap=%d)",
+		opName, lockedR, lockedCap, lockedTWAP, cur.R, cur.PayoutCap, cur.TWAP)
 }
 
 func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
@@ -2119,7 +2154,7 @@ func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
 		return fmt.Errorf("lease_settle attestation: %w", err)
 	}
 
-	expiry := lease.StartTime + int64(lease.Duration)*1e9
+	expiry := lease.EffectiveExpiry()
 	if settleTime < expiry {
 		return fmt.Errorf("lease not yet expired: need timestamp >= %d, got %d", expiry, settleTime)
 	}
@@ -2128,16 +2163,12 @@ func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
 		return fmt.Errorf("lease settle past grace: timestamp %d exceeds expiry+grace %d", settleTime, expiry+LeaseSettleGrace)
 	}
 
-	r := lease.LockedR
-	payoutCap := lease.LockedPayoutCap
-	twap := lease.LockedTWAP
-	rCapped := CapR(r, payoutCap, twap)
-	expectedXE, err := LeaseEmissionChecked(lease.Cost, rCapped)
+	expectedXE, err := LeaseTotalEmission(lease)
 	if err != nil {
 		return fmt.Errorf("lease_settle: %w", err)
 	}
 	if b.Amount != expectedXE {
-		return fmt.Errorf("lease_settle XE mismatch: expected %d (cost=%d, R=%d, R_capped=%d), got %d", expectedXE, lease.Cost, r, rCapped, b.Amount)
+		return fmt.Errorf("lease_settle XE mismatch: expected %d (segments=%d, base cost=%d, R=%d), got %d", expectedXE, len(lease.Renewals)+1, lease.Cost, lease.LockedR, b.Amount)
 	}
 
 	escrow, err := l.getPendingSendOverlay(b.Source)
@@ -2184,6 +2215,8 @@ func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
 
 	commit.ExpectLeaseHash = b.Source
 	commit.ExpectLeaseState = LeaseAccepted
+
+	commit.ExpectLeaseEffectiveDurationSecs = lease.EffectiveDurationSecs()
 
 	commit.AssetCredit = &AssetDelta{Account: b.Account, Asset: "XUSD", Amount: lease.Stake}
 

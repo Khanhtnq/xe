@@ -34,6 +34,53 @@ func (h *Handler) handleGetCertificateByHash(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, cert)
 }
 
+type certificateNoncesResponse struct {
+	Hash    string   `json:"hash"`
+	Seed    string   `json:"seed"`
+	Puzzles uint64   `json:"puzzles"`
+	CPUHash string   `json:"cpu_hash"`
+	Nonces  []uint64 `json:"nonces"`
+}
+
+func (h *Handler) handleGetCertificateNonces(w http.ResponseWriter, r *http.Request) {
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, http.StatusBadRequest, "missing certificate hash")
+		return
+	}
+	nonces := h.node.CertificateNonces(hash)
+	if nonces == nil {
+		writeError(w, http.StatusNotFound, "no witness held for that certificate")
+		return
+	}
+	cert := h.node.GetCertificateByHash(hash)
+	if cert == nil {
+		writeError(w, http.StatusNotFound, "no certificate with that hash")
+		return
+	}
+	writeJSON(w, http.StatusOK, certificateNoncesResponse{
+		Hash:    cert.Hash,
+		Seed:    cert.Seed,
+		Puzzles: cert.Puzzles,
+		CPUHash: cert.CPUHash,
+		Nonces:  nonces,
+	})
+}
+
+func (h *Handler) handleGetCertificateAttestations(w http.ResponseWriter, r *http.Request) {
+	hash := r.PathValue("hash")
+	if hash == "" {
+		writeError(w, http.StatusBadRequest, "missing certificate hash")
+		return
+	}
+	atts := h.node.CertificateAttestations(hash)
+	if atts == nil {
+		writeError(w, http.StatusNotFound, "no attestations held for that certificate")
+		return
+	}
+	writeJSON(w, http.StatusOK, atts)
+}
+
 func (h *Handler) handleGetCertificateByProvider(w http.ResponseWriter, r *http.Request) {
 	provider := r.PathValue("provider")
 	if provider == "" {
@@ -101,5 +148,36 @@ func (h *Handler) handleLeaseRequest(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"lease_hash": leaseHash,
+	})
+}
+
+func (h *Handler) handleLeaseRenew(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	leaseHash := r.PathValue("hash")
+	if leaseHash == "" {
+		writeError(w, http.StatusBadRequest, "lease hash required")
+		return
+	}
+	var req struct {
+		AdditionalSecs uint64 `json:"additional_secs"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.AdditionalSecs == 0 {
+		writeError(w, http.StatusBadRequest, "additional_secs required")
+		return
+	}
+	b, err := h.node.RenewLease(leaseHash, req.AdditionalSecs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"renew_hash": b.Hash,
+		"lease_hash": leaseHash,
+		"cost":       b.Amount,
+		"duration":   b.Duration,
 	})
 }

@@ -13,19 +13,30 @@ import (
 	"github.com/xeprotocol/xe/core"
 )
 
-const (
-	CertificateValidity = 7 * 24 * time.Hour
-)
+var CertificateValidity = 7 * 24 * time.Hour
+
+var AcceptedWorkloadVersions = []uint64{WorkloadVersion}
+
+func IsAcceptedWorkloadVersion(v uint64) bool {
+	for _, accepted := range AcceptedWorkloadVersions {
+		if v == accepted {
+			return true
+		}
+	}
+	return false
+}
 
 type Certificate struct {
 	Provider string `json:"provider"`
 
-	ProviderPubKey  string  `json:"provider_pub_key"`
-	Seed            string  `json:"seed"`
-	WorkloadVersion uint64  `json:"workload_version"`
-	Iterations      uint64  `json:"iterations"`
-	WorkProof       string  `json:"work_proof"`
-	Score           float64 `json:"score"`
+	ProviderPubKey  string `json:"provider_pub_key"`
+	Seed            string `json:"seed"`
+	WorkloadVersion uint64 `json:"workload_version"`
+	Puzzles         uint64 `json:"puzzles"`
+	WorkProof       string `json:"work_proof"`
+
+	CPUHash string  `json:"cpu_hash"`
+	Score   float64 `json:"score"`
 
 	StartAttestationRoot string `json:"start_attestation_root"`
 	EndAttestationRoot   string `json:"end_attestation_root"`
@@ -105,8 +116,10 @@ func HashCertificate(c *Certificate) string {
 	writeLenPrefixed(h, []byte(c.ProviderPubKey))
 	writeLenPrefixed(h, []byte(c.Seed))
 	writeUint64(h, c.WorkloadVersion)
-	writeUint64(h, c.Iterations)
+	writeUint64(h, c.Puzzles)
 	writeLenPrefixed(h, []byte(c.WorkProof))
+
+	writeLenPrefixed(h, []byte(c.CPUHash))
 	writeFloat64(h, c.Score)
 	writeLenPrefixed(h, []byte(c.StartAttestationRoot))
 	writeLenPrefixed(h, []byte(c.EndAttestationRoot))
@@ -162,12 +175,17 @@ func VerifyCertificateContent(c *Certificate) error {
 		return fmt.Errorf("certificate score must be positive, got %f", c.Score)
 	}
 
-	if c.WorkloadVersion != WorkloadVersion {
-		return fmt.Errorf("workload version mismatch: got %d, want %d", c.WorkloadVersion, WorkloadVersion)
+	if !IsAcceptedWorkloadVersion(c.WorkloadVersion) {
+		return fmt.Errorf("workload version %d not accepted, accepted set is %v",
+			c.WorkloadVersion, AcceptedWorkloadVersions)
 	}
 
-	if c.Iterations != BenchmarkIterations {
-		return fmt.Errorf("iterations mismatch: got %d, want %d", c.Iterations, BenchmarkIterations)
+	if c.Puzzles != PoWPuzzles {
+		return fmt.Errorf("puzzles mismatch: got %d, want %d", c.Puzzles, PoWPuzzles)
+	}
+
+	if !isHex64(c.CPUHash) {
+		return fmt.Errorf("cpu_hash must be 64 lowercase hex chars, got %q", c.CPUHash)
 	}
 
 	if c.PriceMultiplierMilli < PriceMultiplierMin || c.PriceMultiplierMilli > PriceMultiplierMax {
@@ -195,4 +213,17 @@ func writeInt64(h interface{ Write([]byte) (int, error) }, v int64) {
 
 func writeFloat64(h interface{ Write([]byte) (int, error) }, v float64) {
 	writeUint64(h, math.Float64bits(v))
+}
+
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -211,65 +211,20 @@ func (gw *SSHGateway) handleDirectTCPIP(channel ssh.Channel, lease *core.Lease) 
 func (gw *SSHGateway) handleSession(channel ssh.Channel, requests <-chan *ssh.Request, lease *core.Lease) {
 	defer func() { _ = channel.Close() }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		select {
-		case <-gw.done:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
 	for req := range requests {
 		switch req.Type {
-		case "pty-req":
+		case "pty-req", "env", "window-change":
 			if req.WantReply {
 				_ = req.Reply(true, nil)
 			}
 
-		case "shell":
+		case "shell", "exec":
 			if req.WantReply {
 				_ = req.Reply(true, nil)
 			}
-
-			providerPeer := gw.backend.PeerForAccount(lease.Provider)
-			if providerPeer == "" {
-				_, _ = fmt.Fprintf(channel, "provider not reachable\r\n")
-				sendExitStatus(channel, 1)
-				return
-			}
-
-			tunnel, err := gw.backend.OpenTunnel(ctx, providerPeer, lease.LeaseHash)
-			if err != nil {
-				_, _ = fmt.Fprintf(channel, "tunnel error: %v\r\n", err)
-				sendExitStatus(channel, 1)
-				return
-			}
-			defer func() { _ = tunnel.Close() }()
-
-			var wg sync.WaitGroup
-			wg.Add(2)
-
-			go func() {
-				defer wg.Done()
-				_, _ = io.Copy(channel, tunnel)
-			}()
-
-			go func() {
-				defer wg.Done()
-				_, _ = io.Copy(tunnel, channel)
-			}()
-
-			wg.Wait()
-			sendExitStatus(channel, 0)
+			_, _ = io.WriteString(channel.Stderr(), gw.jumpHint(lease.LeaseHash))
+			sendExitStatus(channel, 1)
 			return
-
-		case "window-change":
-			if req.WantReply {
-				_ = req.Reply(true, nil)
-			}
 
 		default:
 			if req.WantReply {
@@ -277,6 +232,17 @@ func (gw *SSHGateway) handleSession(channel ssh.Channel, requests <-chan *ssh.Re
 			}
 		}
 	}
+}
+
+func (gw *SSHGateway) jumpHint(leaseHash string) string {
+	port := 2222
+	if tcp, ok := gw.listener.Addr().(*net.TCPAddr); ok {
+		port = tcp.Port
+	}
+	return fmt.Sprintf("This XE gateway forwards SSH to your VM; it does not open a shell itself.\r\n"+
+		"Connect to the VM through it:\r\n\r\n"+
+		"  ssh -i <lease key> -J %s@<gateway host>:%d root@vm\r\n\r\n"+
+		"or: xe ssh %s\r\n", leaseHash, port, leaseHash)
 }
 
 func sendExitStatus(channel ssh.Channel, code uint32) {

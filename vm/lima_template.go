@@ -26,6 +26,12 @@ mounts: []
 containerd:
   system: false
   user: false
+# Lima's host resolver stalls ~1s on AAAA queries.
+hostResolver:
+  enabled: false
+dns:
+  - 1.1.1.1
+  - 8.8.8.8
 provision:
   - mode: system
     script: |
@@ -37,6 +43,7 @@ provision:
       sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
       sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
       systemctl restart sshd
+      grep -qxF 'precedence ::ffff:0:0/96 100' /etc/gai.conf 2>/dev/null || echo 'precedence ::ffff:0:0/96 100' >> /etc/gai.conf
 `
 
 var limaTmpl = template.Must(template.New("lima").Parse(limaYAMLTemplate))

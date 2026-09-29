@@ -36,6 +36,7 @@ const (
 	BlockLeaseSettle      BlockType = "lease_settle"
 	BlockLeaseCancel      BlockType = "lease_cancel"
 	BlockLeaseForceSettle BlockType = "lease_force_settle"
+	BlockLeaseRenew       BlockType = "lease_renew"
 	BlockMultisigOpen     BlockType = "multisig_open"
 	BlockMultisigUpdate   BlockType = "multisig_update"
 )
@@ -212,6 +213,31 @@ type Lease struct {
 	LockedR         uint64 `json:"locked_r,omitempty"`
 	LockedPayoutCap uint64 `json:"locked_payout_cap,omitempty"`
 	LockedTWAP      uint64 `json:"locked_twap_milli,omitempty"`
+
+	Renewals []LeaseSegment `json:"renewals,omitempty"`
+}
+
+type LeaseSegment struct {
+	RenewHash       string `json:"renew_hash"`
+	Duration        uint64 `json:"duration"`
+	Cost            uint64 `json:"cost"`
+	StartTime       int64  `json:"start_time"`
+	CertificateHash string `json:"certificate_hash,omitempty"`
+	LockedR         uint64 `json:"locked_r,omitempty"`
+	LockedPayoutCap uint64 `json:"locked_payout_cap,omitempty"`
+	LockedTWAP      uint64 `json:"locked_twap_milli,omitempty"`
+}
+
+func (l *Lease) EffectiveDurationSecs() uint64 {
+	total := l.Duration
+	for i := range l.Renewals {
+		total += l.Renewals[i].Duration
+	}
+	return total
+}
+
+func (l *Lease) EffectiveExpiry() int64 {
+	return l.StartTime + int64(l.EffectiveDurationSecs())*int64(time.Second)
 }
 
 func (l *Lease) BackfillState() {

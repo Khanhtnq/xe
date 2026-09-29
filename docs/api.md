@@ -25,7 +25,7 @@ fields you see against your own node will differ.
 - **Rate limit.** Per-IP token buckets, split by request class → `429 {"error":"rate limit exceeded"}`: **reads** (any GET) 200 req/s sustained, burst 1000; **writes** (POST block/state submit, chat, directory register) 10 req/s, burst 50; **probes** (`GET /health`, `GET /ready`) 20 req/s, burst 100 in a bucket of their own, so browsing traffic can never 429 a supervisor's probe into killing a healthy node. Behind the local reverse proxy the real client IP is taken from the rightmost `X-Forwarded-For` hop. Clients doing bulk reads must handle `429` and back off — a plain sequential sweep of the public `*.core.test.network` URLs can trip the limiter because external clients behind Caddy/NAT share an egress bucket.
 - **Body cap.** POST bodies are capped at **1 MiB** → `400`.
 - **CORS.** `Access-Control-Allow-Methods: GET, POST, OPTIONS`; allowed origin is configurable (default `http://localhost:3000`). `OPTIONS` preflight returns `204`.
-- **Auth.** The public API is unauthenticated **except** operator-only endpoints (`POST /lease/request`, the unfiltered `GET /chat/events` firehose, and the node-wide `GET /chat/contacts` list), which require `Authorization: Bearer <token>` where the token is set via `XE_API_ADMIN_TOKEN`. If no token is configured the endpoint returns `403`.
+- **Auth.** The public API is unauthenticated **except** operator-only endpoints (`POST /lease/request`, `POST /lease/{hash}/renew`, the unfiltered `GET /chat/events` firehose, and the node-wide `GET /chat/contacts` list), which require `Authorization: Bearer <token>` where the token is set via `XE_API_ADMIN_TOKEN`. If no token is configured the endpoint returns `403`.
 
 ### Addresses vs. keys
 
@@ -97,6 +97,7 @@ key delivered alongside the address:
 | POST | `/blocks/lease_settle` | Submit a signed lease_settle block |
 | POST | `/blocks/lease_cancel` | Submit a signed lease_cancel block |
 | POST | `/blocks/lease_force_settle` | Submit a signed lease_force_settle block |
+| POST | `/blocks/lease_renew` | Submit a signed lease_renew block |
 | POST | `/blocks/multisig_open` | Submit a signed multisig_open block |
 | POST | `/blocks/multisig_update` | Submit a signed multisig_update block |
 | POST | `/blocks/burn` | Submit a signed burn block (XE only) |
@@ -108,9 +109,12 @@ key delivered alongside the address:
 | GET | `/certificate` | This node's perf certificate (provider mode) |
 | GET | `/certificate/{provider}` | Current unexpired perf certificate for a provider |
 | GET | `/certificate/hash/{hash}` | Retained perf certificate by hash, including expired |
+| GET | `/certificate/nonces/{hash}` | CPU-chain witness for a certificate this node issued |
+| GET | `/certificate/attestations/{hash}` | Full timekeeper attestations behind a certificate this node issued |
 | GET | `/leases` | All leases; `?state=` filter (paginated) |
 | GET | `/leases/{hash}` | Lease by hash |
 | POST | `/lease/request` | Request a lease — node signs + PoWs (**operator only**) |
+| POST | `/lease/{hash}/renew` | Renew (extend) an accepted lease in place — node signs + PoWs (**operator only**) |
 | GET | `/vms` | All running VMs |
 | GET | `/vms/{lease}` | VM info for a lease |
 | POST | `/tunnel/{leaseHash}/tcp` | Open a TCP tunnel into a lease's VM (hijack) |
@@ -575,7 +579,7 @@ XE is created only by the genesis block and by `lease_settle` emission, and dest
 only by `burn` blocks. XUSD is created only by an authorized `mint`, and destroyed only
 when a lease's escrow is burnt (at settle, or at escrow expiry) or a provider's
 stake is forfeited by absence. Everything else — send, receive, `lease_cancel`,
-`lease_force_settle`, `multisig_*` — is supply-neutral. `locked_stake` is the one term a
+`lease_force_settle`, `lease_renew`, `multisig_*` — is supply-neutral (a renewal moves consumer XUSD into the lease escrow, which settle burns or force-settle refunds). `locked_stake` is the one term a
 naive `balances + pending` sum misses: a provider's stake leaves balances at
 `lease_accept` and is held on the lease record until settle, invisible to both.
 
@@ -754,6 +758,7 @@ Reference implementations: `core.MarshalBlockAux` (Go),
 - `lease` — consumer-signed; `vcpus`, `memory_mb`, `disk_gb`, `duration` (secs), `access_pub_key`.
 - `lease_accept` — provider-signed; carries `certificate_hash`, `attestations`, and the locked emission params `locked_r` / `locked_payout_cap` / `locked_twap_milli`.
 - `lease_settle` / `lease_force_settle` — carry `attestations`.
+- `lease_renew` — consumer-signed; extends an accepted lease in place. Carries `source` (the lease hash), `amount` (additional XUSD escrowed at the provider's current rate), `duration` (additional secs), `certificate_hash` (the provider's current cert), the locked emission params `locked_r` / `locked_payout_cap` / `locked_twap_milli` (from the epoch at the attested renewal time), and `attestations`. It grows the single lease escrow in place; settle then sums emission over the base plus every renewal, each at its own locked R. **Gated on the `lease_renew` activation** (`sys.activations`): before activation the block is rejected retryably as "not yet activated"; a node that does not know the type ignores it.
 - `multisig_open` / `multisig_update` — carry `keyset` and `signatures` (one per signer).
 - `burn` — **XE only** (enforced by the ledger validator); optional `memo`.
 - `mint` — **XUSD, authorized minter only** (`sys.minter`); rejected otherwise. `sys.minter.keys` holds account **addresses**, matched against the block's `account` (unlike `sys.timekeepers` / `sys.oracle` / `sys.dao_keyset`, which hold verifying keys matched against signatures).
@@ -866,8 +871,9 @@ holds nothing — whether a provider can take it is decided at accept time.
 This node's performance certificate (only meaningful in provider mode). No params.
 ```json
 {
-  "provider": "<account>", "seed": "<hex>", "workload_version": 1, "iterations": 1000000,
-  "work_proof": "<hex>", "score": 1234.5,
+  "provider": "<account>", "provider_pub_key": "<hex>", "seed": "<hex>",
+  "workload_version": 4, "puzzles": 1024,
+  "work_proof": "<hex>", "cpu_hash": "<hex>", "score": 1234.5,
   "start_attestation_root": "<hex>", "end_attestation_root": "<hex>",
   "start_median": 1781800000000000000, "end_median": 1781800600000000000,
   "issued_at": 1781800600000000000, "expires_at": 1781887000000000000,
@@ -883,6 +889,28 @@ The provider's current **unexpired** performance certificate — what a consumer
 A retained performance certificate by its own hash, **including expired ones**. Path: `hash` (certificate hash). Same body as above.
 
 Lease blocks pin the hash of the certificate that was current when they were written, and the ledger validates them against the block's timestamp — so a node must keep serving those certificates long after they expire. Use this to check that the certificate backing historical lease blocks is still held after a provider has rotated. Errors: `400 missing certificate hash`, `404 no certificate with that hash`.
+
+### GET /certificate/nonces/{hash}
+The **witness** for the certificate's CPU phase: one solving nonce per chained proof of work, in chain order. Path: `hash` (certificate hash).
+```json
+{
+  "hash": "<hex>", "seed": "<hex>", "puzzles": 1024, "cpu_hash": "<hex>",
+  "nonces": [83122, 41905, 1108447, "... 1024 entries total"]
+}
+```
+Verifying is `perf.VerifyCPUChain(seed, nonces, puzzles)` and comparing the result against `cpu_hash` — one hash per puzzle, ~127 µs, against the ~5.4e8 hashes the provider paid to find the nonces. `cpu_hash` is inside the certificate's signature, so a witness that reproduces it is a signed claim the provider cannot retract. The memory phase has no witness; checking `work_proof` still means rebuilding the 256 MB table (`perf.VerifyWork`).
+
+The witness is ~8 KB and so is **not** carried in the certificate, which is gossiped and served in batches. It therefore exists only on the node that issued the certificate: a node serves witnesses for its own certificates and 404s for the ones it retains from peers, rather than returning an empty list. Errors: `400 missing certificate hash`, `404 no witness held for that certificate`.
+
+### GET /certificate/attestations/{hash}
+The full start and end timekeeper attestations behind a certificate. Path: `hash` (certificate hash). The certificate carries only their merkle roots (`start_attestation_root` / `end_attestation_root`) so it stays compact; this is what lets a verifier recompute those roots and check each timekeeper signature.
+```json
+{
+  "start": [ { "public_key": "<hex>", "timestamp": 1781800000000000000, "signature": "<hex>" } ],
+  "end":   [ { "public_key": "<hex>", "timestamp": 1781800600000000000, "signature": "<hex>" } ]
+}
+```
+Same ownership rule as the witness above — only the issuing node holds these. Errors: `400 missing certificate hash`, `404 no attestations held for that certificate`.
 
 ---
 
@@ -1011,6 +1039,13 @@ Response `200`:
 > `sys.timekeepers` key list on the state chain — timekeeper identity is a key,
 > not an account address. Errors: `400 invalid request body`,
 > `400 lease_hash required`, `400 <attestation error>`.
+
+**Rate limited: one attestation per identifier per client IP every 15 seconds**. The same window applies to the p2p route, keyed on the peer ID — the
+limit lives at the shared entry point, so no transport can serve more. A
+request rejected by validation does **not** consume the window, so a request
+that merely raced the lease's propagation can retry immediately. Treat
+`400 rate limited: retry after <d>` as **retryable**: back off for the stated
+interval rather than failing the operation.
 
 ---
 

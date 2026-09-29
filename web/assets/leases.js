@@ -135,6 +135,12 @@ async function loadDetail(hash) {
     ['memory mb', text(commas(lease.memory_mb))],
     ['disk gb', text(commas(lease.disk_gb))],
     ['duration', text(durationString(lease.duration))],
+    ...(Array.isArray(lease.renewals) && lease.renewals.length
+      ? [
+          ['renewals', text(`${lease.renewals.length} × extension`)],
+          ['effective duration', text(durationString((lease.duration || 0) + lease.renewals.reduce((a, r) => a + (r.duration || 0), 0)))],
+        ]
+      : []),
     ['cost (XUSD)', text(formatAmount(lease.cost, 'XUSD'))],
     ['stake (XUSD)', text(formatAmount(lease.stake, 'XUSD'))],
     ['start time', text(lease.start_time ? `${timeOfDay(lease.start_time)} · ${relativeTime(lease.start_time)}` : '–')],
