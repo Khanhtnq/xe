@@ -19,7 +19,7 @@ func (l *Ledger) blockDependencies(b *Block) []blockDep {
 		deps = append(deps, blockDep{account: b.Account, hash: b.Previous})
 	}
 	switch b.Type {
-	case BlockReceive, BlockLeaseAccept, BlockLeaseSettle, BlockLeaseCancel, BlockLeaseForceSettle:
+	case BlockReceive, BlockLeaseAccept, BlockLeaseSettle, BlockLeaseCancel, BlockLeaseForceSettle, BlockLeaseRenew:
 
 		if b.Source != "" && b.Source != "0" {
 			deps = append(deps, blockDep{account: l.accountOfBlock(b.Source), hash: b.Source})

@@ -2110,6 +2110,10 @@ func (l *Ledger) validateLockedEmissionAt(atTime int64, lockedR, lockedCap, lock
 		opName, lockedR, lockedCap, lockedTWAP, cur.R, cur.PayoutCap, cur.TWAP)
 }
 
+func renewalMayBeMissing(lease *Lease) bool {
+	return lease.EffectiveDurationSecs() < LeaseMaxDuration
+}
+
 func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
 	if b.Asset != "XE" {
 		return fmt.Errorf("lease_settle block must have asset=XE")
@@ -2160,6 +2164,10 @@ func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
 	}
 
 	if settleTime > expiry+LeaseSettleGrace {
+
+		if skipSkew && renewalMayBeMissing(lease) {
+			return fmt.Errorf("lease settle past grace for the renewals applied here: timestamp %d exceeds expiry+grace %d: retry after sync", settleTime, expiry+LeaseSettleGrace)
+		}
 		return fmt.Errorf("lease settle past grace: timestamp %d exceeds expiry+grace %d", settleTime, expiry+LeaseSettleGrace)
 	}
 
@@ -2168,6 +2176,10 @@ func (l *Ledger) validateAndAddLeaseSettle(b *Block, skipSkew bool) error {
 		return fmt.Errorf("lease_settle: %w", err)
 	}
 	if b.Amount != expectedXE {
+
+		if skipSkew && b.Amount > expectedXE && renewalMayBeMissing(lease) {
+			return fmt.Errorf("lease_settle XE exceeds the %d segment(s) applied here: expected %d, got %d: retry after sync", len(lease.Renewals)+1, expectedXE, b.Amount)
+		}
 		return fmt.Errorf("lease_settle XE mismatch: expected %d (segments=%d, base cost=%d, R=%d), got %d", expectedXE, len(lease.Renewals)+1, lease.Cost, lease.LockedR, b.Amount)
 	}
 
