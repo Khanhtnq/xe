@@ -184,7 +184,31 @@ Wallet created!
   Address:    7d27d0a34cc2a5cd08f65905a983fabec1a517baf6d3cdab0a921256ecb9af57
   Public key: 665b50f96f8a4a86e1940386cce7fa1c0592c8eba9524fe9d579254fc341f02b
   File:       /home/you/.xe/alice.seed
+
+Recovery phrase:
+
+  1. <word 1> ... 24. <word 24>
 ```
+
+The actual output contains 24 numbered BIP39 words and backup instructions.
+Write them down before using the wallet. The phrase is your only backup unless
+you keep the hex seed separately. Anyone with the backup controls the wallet.
+XE uses BIP39 + SLIP-0010 ed25519 at `m/44'/1'/account'` (default account 0;
+coin type 1 is provisional). Import accepts 12, 15, 18, 21 or 24 words.
+
+`./xe wallet restore [--account N] [--passphrase]` reads words from stdin.
+`--passphrase` opts into a separate hidden BIP39 passphrase prompt, never argv.
+Creation asks twice and writes no files if the entries differ. Restore asks once;
+check the printed address.
+It is never stored; a wrong passphrase opens a different, empty account.
+`./xe wallet phrase` displays the stored words only if the address recorded in
+`alice.phrase` matches the seed's address. A missing or mismatched address refuses
+reveal and directs you to the hex seed backup. The phrase file contains the words,
+`account: N` and `address: <64 hex>` on separate lines. It and the unchanged
+`alice.seed` file both use mode 0600. Create and restore refuse to overwrite a
+stray phrase file, even if the seed is missing.
+Wallets made before v2 restore from their hex seed, not their old words.
+See [recovery phrase v2](docs/recovery-phrase.md) for storage and browser flows.
 
 The **address** is what you hand out. It is `sha256("xe/account/v1" ‖ pubkey)`,
 not the public key itself: identity and credential are separate, so a key can be

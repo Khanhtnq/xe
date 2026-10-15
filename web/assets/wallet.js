@@ -1,7 +1,7 @@
 import { api, fetchChainTail } from './api.js';
 import { shortAddr, shortHash, timeOfDay, formatAmount, parseAmount } from './format.js';
 import {
-  hexToBytes, bytesToHex, randomSeed,
+  hexToBytes, bytesToHex,
   loadKeyPair, verifyKnownBlock, fetchBlockJsonLossless,
   buildAndSubmitSend, buildAndSubmitReceive, requestFaucet,
 } from './xe-block.js';
@@ -9,10 +9,11 @@ import {
   loadVault, saveVault, emptyVault,
   hasLegacySeed, loadLegacySeed, deleteLegacySeed,
   loadLegacyActivity, deleteLegacyActivity,
-  buildWalletEntry, decryptSeed, syncWalletIdentity,
+  buildWalletEntry, decryptSeed, decryptPhrase, syncWalletIdentity,
   cacheUnlock, loadCachedUnlock, clearCachedUnlock, tryCachedDecrypt,
 } from './vault.js';
 import { loadSnapshot, saveSnapshot } from './persist.js';
+import { generatePhrase, validatePhrase, seedFromPhrase, pickCheckPositions } from './recovery-phrase.js';
 
 const ACTIVITY_PREFIX = 'xe.wallet.activity.';
 const ACTIVITY_MAX = 20;
@@ -131,15 +132,31 @@ function clampActive() {
 function bindHandlers() {
   document.getElementById('btn-create').addEventListener('click', () => switchSetupMode('create'));
   document.getElementById('btn-import-toggle').addEventListener('click', () => switchSetupMode('import'));
+  document.getElementById('btn-next-account').addEventListener('click', () => switchSetupMode('account'));
+  document.getElementById('setup-bip39-enabled').addEventListener('change', (e) => {
+    const input = document.getElementById('setup-bip39-passphrase');
+    input.disabled = !e.target.checked;
+    if (input.disabled) {
+      input.value = '';
+      document.getElementById('setup-bip39-passphrase-confirm').value = '';
+    }
+    updateBIP39Confirmation();
+  });
+  document.getElementById('setup-bip39-passphrase').addEventListener('input', updateBIP39Confirmation);
+  document.getElementById('setup-bip39-passphrase-confirm').addEventListener('input', updateBIP39Confirmation);
   document.getElementById('setup-form').addEventListener('submit', onSetupSubmit);
   document.getElementById('btn-confirm-seed-saved').addEventListener('click', onConfirmSeedSaved);
   document.getElementById('seed-saved-check').addEventListener('change', (e) => {
-    document.getElementById('btn-confirm-seed-saved').disabled = !e.target.checked;
+    document.getElementById('seed-confirm-display').hidden = e.target.checked;
+    document.getElementById('seed-confirm-advanced').hidden = e.target.checked;
+    document.getElementById('btn-copy-confirm-seed').hidden = e.target.checked;
+    document.getElementById('phrase-checks').hidden = !e.target.checked;
+    updatePhraseCheck();
   });
   document.getElementById('btn-copy-confirm-seed').addEventListener('click', async () => {
     if (!state.pendingSeedBytes) return;
-    await navigator.clipboard.writeText(bytesToHex(state.pendingSeedBytes));
-    showInfo('seed copied.');
+    await navigator.clipboard.writeText(state.pendingPhrase);
+    showInfo('phrase copied.');
   });
 
   document.getElementById('migrate-form').addEventListener('submit', onMigrateSubmit);
@@ -157,21 +174,40 @@ function bindHandlers() {
   document.getElementById('btn-copy-reveal').addEventListener('click', async () => {
     const text = document.getElementById('reveal-display').textContent;
     if (text) await navigator.clipboard.writeText(text);
-    showInfo('seed copied.');
+    showInfo('backup copied.');
   });
   document.getElementById('btn-hide-reveal').addEventListener('click', () => {
     document.getElementById('reveal-output').hidden = true;
     document.getElementById('reveal-display').textContent = '';
+    document.getElementById('reveal-hex').textContent = '';
   });
 }
 
 let setupMode = 'create';
+let setupBusy = false;
+
+function bip39ConfirmationMatches() {
+  return setupMode !== 'create' || !document.getElementById('setup-bip39-enabled').checked ||
+    document.getElementById('setup-bip39-passphrase').value === document.getElementById('setup-bip39-passphrase-confirm').value;
+}
+
+function updateBIP39Confirmation() {
+  const required = setupMode === 'create' && document.getElementById('setup-bip39-enabled').checked;
+  document.getElementById('setup-bip39-confirm-label').hidden = !required;
+  document.getElementById('setup-bip39-passphrase-confirm').disabled = !required;
+  document.getElementById('setup-submit').disabled = setupBusy || !bip39ConfirmationMatches();
+}
 
 function switchSetupMode(mode) {
+  clearPendingPhrase();
   setupMode = mode;
+  document.getElementById('setup-bip39-passphrase-confirm').value = '';
+  updateBIP39Confirmation();
   const seedLabel = document.getElementById('setup-seed-label');
   const submit = document.getElementById('setup-submit');
   const seedInput = document.getElementById('setup-seed-input');
+  document.getElementById('setup-account').disabled = mode !== 'import';
+  document.getElementById('setup-account').value = mode === 'account' ? (activeWallet().account || 0) + 1 : 0;
   if (mode === 'import') {
     seedLabel.hidden = false;
     seedInput.required = true;
@@ -179,7 +215,7 @@ function switchSetupMode(mode) {
   } else {
     seedLabel.hidden = true;
     seedInput.required = false;
-    submit.textContent = 'create wallet';
+    submit.textContent = mode === 'account' ? 'derive next account' : 'create wallet';
   }
 }
 
@@ -190,43 +226,129 @@ async function onSetupSubmit(ev) {
   const pass2 = document.getElementById('setup-passphrase-confirm').value;
   if (pass1.length < 8) { showError('passphrase must be at least 8 characters'); return; }
   if (pass1 !== pass2) { showError('passphrases do not match'); return; }
+  if (!bip39ConfirmationMatches()) { showError('BIP39 passphrases do not match'); return; }
+  if (setupBusy) return;
 
-  if (setupMode === 'import') {
-    const hex = document.getElementById('setup-seed-input').value.trim().toLowerCase();
+  setupBusy = true;
+  updateBIP39Confirmation();
+  try {
+    const mode = setupMode;
+    const input = document.getElementById('setup-seed-input').value.trim();
+    const passInput = document.getElementById('setup-bip39-passphrase');
+    const bip39Pass = document.getElementById('setup-bip39-enabled').checked ? passInput.value : '';
+    const account = Number(document.getElementById('setup-account').value);
+    if (state.vault?.wallets.length) await decryptSeed(pass1, activeWallet());
+    let phrase = null;
     let seed;
-    try { seed = hexToBytes(hex, 32); } catch (e) { showError('seed: ' + e.message); return; }
-    await persistNewWallet(name, seed, pass1);
-    state.passphrase = pass1;
-    cacheUnlock(pass1);
-    await activateActive();
-    showInfo(`wallet "${name}" imported.`);
-  } else {
-    state.pendingSeedBytes = randomSeed();
-    state.pendingSeedName = name;
-    state.pendingSeedPassphrase = pass1;
-    document.getElementById('seed-confirm-display').textContent = bytesToHex(state.pendingSeedBytes);
-    document.getElementById('seed-saved-check').checked = false;
-    document.getElementById('btn-confirm-seed-saved').disabled = true;
-    document.getElementById('seed-confirm-section').hidden = false;
+    if (mode === 'import' && /^[0-9a-f]{64}$/i.test(input)) {
+      if (bip39Pass || account !== 0) throw new Error('hex seed import does not use a BIP39 passphrase or account index');
+      seed = hexToBytes(input, 32);
+    } else {
+      if (mode === 'create') phrase = await generatePhrase();
+      else if (mode === 'account') phrase = await decryptPhrase(state.passphrase, activeWallet());
+      else phrase = await validatePhrase(input);
+      if (!phrase) throw new Error('this hex-only wallet has no recovery phrase');
+      if (mode === 'account') {
+        const currentSeed = await seedFromPhrase(phrase, { passphrase: bip39Pass, account: activeWallet().account || 0 });
+        if (!currentSeed.every((byte, i) => byte === state.seed[i])) {
+          passInput.value = '';
+          throw new Error('BIP39 passphrase does not match this wallet; the next account was not created');
+        }
+      }
+      seed = await seedFromPhrase(phrase, { passphrase: bip39Pass, account });
+    }
+    passInput.value = '';
+    document.getElementById('setup-bip39-passphrase-confirm').value = '';
+    document.getElementById('setup-seed-input').value = '';
+    if (mode === 'create') {
+      state.pendingSeedBytes = seed;
+      state.pendingPhrase = phrase;
+      state.pendingSeedName = name;
+      state.pendingSeedPassphrase = pass1;
+      stagePhraseCheck(phrase);
+    } else {
+      await persistNewWallet(name, seed, pass1, phrase ? { phrase, account } : null);
+      state.passphrase = pass1;
+      cacheUnlock(pass1);
+      await activateActive();
+      showInfo(`wallet "${name}" imported. account ${account}.`);
+    }
+  } catch (e) {
+    showError(e.message);
+  } finally {
+    setupBusy = false;
+    updateBIP39Confirmation();
   }
 }
 
-async function onConfirmSeedSaved() {
-  if (!state.pendingSeedBytes || !state.pendingSeedPassphrase) return;
-  await persistNewWallet(state.pendingSeedName, state.pendingSeedBytes, state.pendingSeedPassphrase);
-  state.passphrase = state.pendingSeedPassphrase;
-  cacheUnlock(state.pendingSeedPassphrase);
-  state.pendingSeedBytes = null;
-  state.pendingSeedName = null;
-  state.pendingSeedPassphrase = null;
-  document.getElementById('seed-confirm-section').hidden = true;
-  await activateActive();
-  showInfo('wallet created.');
+function stagePhraseCheck(phrase) {
+  const words = phrase.split(' ');
+  document.getElementById('seed-confirm-display').textContent = words.map((word, i) => `${i + 1}. ${word}`).join('\n');
+  document.getElementById('seed-confirm-hex').textContent = bytesToHex(state.pendingSeedBytes);
+  state.checkPositions = pickCheckPositions();
+  const checks = document.getElementById('phrase-checks');
+  checks.replaceChildren();
+  for (const index of state.checkPositions) {
+    const label = document.createElement('label');
+    label.textContent = `word ${index + 1}`;
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.dataset.position = index;
+    input.addEventListener('input', updatePhraseCheck);
+    label.append(input);
+    checks.append(label);
+  }
+  document.getElementById('seed-saved-check').checked = false;
+  document.getElementById('seed-confirm-display').hidden = false;
+  document.getElementById('seed-confirm-advanced').hidden = false;
+  document.getElementById('btn-copy-confirm-seed').hidden = false;
+  checks.hidden = true;
+  document.getElementById('btn-confirm-seed-saved').disabled = true;
+  document.getElementById('seed-confirm-section').hidden = false;
 }
 
-async function persistNewWallet(name, seedBytes, passphrase) {
+function phraseCheckPassed() {
+  if (!state.pendingPhrase || !document.getElementById('seed-saved-check').checked) return false;
+  const words = state.pendingPhrase.split(' ');
+  const inputs = [...document.querySelectorAll('#phrase-checks input')];
+  return inputs.length === 3 && inputs.every(input => input.value.trim().toLowerCase() === words[Number(input.dataset.position)]);
+}
+
+function updatePhraseCheck() {
+  document.getElementById('btn-confirm-seed-saved').disabled = !phraseCheckPassed();
+}
+
+function clearPendingPhrase() {
+  state.pendingSeedBytes = null;
+  state.pendingPhrase = null;
+  state.pendingSeedPassphrase = null;
+  document.getElementById('seed-confirm-display').textContent = '';
+  document.getElementById('seed-confirm-hex').textContent = '';
+  document.getElementById('phrase-checks').replaceChildren();
+  document.getElementById('seed-confirm-section').hidden = true;
+}
+
+async function onConfirmSeedSaved() {
+  if (!state.pendingSeedBytes || !state.pendingSeedPassphrase || !phraseCheckPassed()) return;
+  document.getElementById('btn-confirm-seed-saved').disabled = true;
+  try {
+    await persistNewWallet(state.pendingSeedName, state.pendingSeedBytes, state.pendingSeedPassphrase, { phrase: state.pendingPhrase, account: 0 });
+    state.passphrase = state.pendingSeedPassphrase;
+    cacheUnlock(state.pendingSeedPassphrase);
+    clearPendingPhrase();
+    await activateActive();
+    showInfo('wallet created.');
+  } catch (e) {
+    showError(e.message);
+    updatePhraseCheck();
+  }
+}
+
+async function persistNewWallet(name, seedBytes, passphrase, recovery = null) {
   const kp = await loadKeyPair(seedBytes);
-  const entry = await buildWalletEntry(passphrase, name, kp, seedBytes);
+  const entry = await buildWalletEntry(passphrase, name, kp, seedBytes, recovery);
   if (!state.vault) state.vault = emptyVault();
   if (state.vault.wallets.find(w => w.address === kp.addressHex)) {
     throw new Error('wallet with this address already exists');
@@ -288,6 +410,10 @@ async function onUnlockSubmit(ev) {
 }
 
 function lockWallet() {
+  clearPendingPhrase();
+  document.getElementById('reveal-display').textContent = '';
+  document.getElementById('reveal-hex').textContent = '';
+  document.getElementById('reveal-output').hidden = true;
   state.passphrase = null;
   state.seed = null;
   state.keyPair = null;
@@ -303,32 +429,12 @@ function lockWallet() {
 
 async function onAddWallet() {
   if (!state.passphrase) { showError('unlock first'); return; }
-  const choice = window.prompt('add wallet — type "create" for a new random seed, or paste a 64-hex seed to import:');
-  if (!choice) return;
-  const trimmed = choice.trim().toLowerCase();
-  let seed;
-  if (trimmed === 'create') {
-    seed = randomSeed();
-  } else if (/^[0-9a-f]{64}$/.test(trimmed)) {
-    try { seed = hexToBytes(trimmed, 32); } catch (e) { showError('seed: ' + e.message); return; }
-  } else {
-    showError('expected "create" or a 64-character hex seed.');
-    return;
-  }
-  const name = (window.prompt('name for this wallet:', defaultWalletName()) || '').trim();
-  if (!name) return;
-  try {
-    await persistNewWallet(name.slice(0, 32), seed, state.passphrase);
-  } catch (e) {
-    showError(e.message);
-    return;
-  }
-  if (trimmed === 'create') {
-    showInfo(`wallet created. seed: ${bytesToHex(seed)} — back this up now (use "reveal seed" later).`);
-  } else {
-    showInfo(`wallet "${name}" imported.`);
-  }
-  await activateActive();
+  document.getElementById('setup-name').value = defaultWalletName();
+  document.getElementById('setup-passphrase').value = state.passphrase;
+  document.getElementById('setup-passphrase-confirm').value = state.passphrase;
+  document.getElementById('btn-next-account').hidden = !activeWallet().encrypted_phrase;
+  switchSetupMode('create');
+  showOnly('setup-section');
 }
 
 function defaultWalletName() {
@@ -349,6 +455,9 @@ async function activateActive() {
     return;
   }
   state.keyPair = await loadKeyPair(state.seed);
+  document.getElementById('reveal-display').textContent = '';
+  document.getElementById('reveal-hex').textContent = '';
+  document.getElementById('reveal-output').hidden = true;
   if (syncWalletIdentity(w, state.keyPair)) saveVault(state.vault);
 
   showOnly('wallet-section');
@@ -358,6 +467,10 @@ async function activateActive() {
   renderActivity();
   hydrateFromSnapshot();
   await refreshAll();
+  if (new URLSearchParams(location.search).get('add') === '1') {
+    history.replaceState(null, '', location.pathname);
+    await onAddWallet();
+  }
 }
 
 function snapshotKey() {
@@ -521,7 +634,14 @@ async function onReveal(ev) {
     showError('incorrect passphrase');
     return;
   }
-  document.getElementById('reveal-display').textContent = bytesToHex(seed);
+  const phrase = await decryptPhrase(pass, w);
+  document.getElementById('reveal-display').textContent = phrase || bytesToHex(seed);
+  document.getElementById('reveal-note').textContent = phrase
+    ? `Account ${w.account || 0}. Keep any BIP39 passphrase separately; it is never stored. A wrong passphrase opens a different, empty account.`
+    : 'This wallet was created from a hex seed and has no recovery phrase. Its backup is this hex seed. Wallets made before v2 restore from their hex seed.';
+  document.getElementById('reveal-hex').textContent = bytesToHex(seed);
+  document.getElementById('reveal-advanced').hidden = !phrase;
+  document.getElementById('reveal-advanced').open = false;
   document.getElementById('reveal-output').hidden = false;
 }
 

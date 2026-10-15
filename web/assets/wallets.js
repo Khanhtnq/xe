@@ -1,10 +1,9 @@
 import { api } from './api.js';
 import { shortAddr } from './format.js';
-import { bytesToHex, hexToBytes, randomSeed, loadKeyPair } from './xe-block.js';
+import { bytesToHex } from './xe-block.js';
 import {
-  loadVault, saveVault, emptyVault, removeWallet,
-  decryptSeed, buildWalletEntry,
-  loadCachedUnlock, cacheUnlock,
+  loadVault, saveVault, removeWallet,
+  decryptSeed, decryptPhrase,
 } from './vault.js';
 
 const ACTIVITY_PREFIX = 'xe.wallet.activity.';
@@ -64,10 +63,11 @@ function bindHandlers() {
   document.getElementById('btn-copy-reveal').addEventListener('click', async () => {
     const t = document.getElementById('reveal-display').textContent;
     if (t) await navigator.clipboard.writeText(t);
-    showInfo('seed copied.');
+    showInfo('backup copied.');
   });
   document.getElementById('btn-hide-reveal').addEventListener('click', () => {
     document.getElementById('reveal-display').textContent = '';
+    document.getElementById('reveal-hex').textContent = '';
     document.getElementById('reveal-output').hidden = true;
   });
   document.getElementById('rename-form').addEventListener('submit', onRenameSubmit);
@@ -76,9 +76,6 @@ function bindHandlers() {
   document.getElementById('btn-cancel-remove').addEventListener('click', cancelRemove);
   const addBtn = document.getElementById('btn-add-wallet');
   if (addBtn) addBtn.addEventListener('click', onAddWallet);
-  document.getElementById('add-form').addEventListener('submit', onAddSubmit);
-  document.getElementById('btn-cancel-add').addEventListener('click', cancelAdd);
-  document.getElementById('add-mode').addEventListener('change', onAddModeChange);
 }
 
 function render() {
@@ -109,7 +106,7 @@ function render() {
     tr.appendChild(td(w.created_at ? new Date(w.created_at).toISOString().slice(0, 10) : '–'));
     const actions = document.createElement('td');
     actions.appendChild(actionBtn('rename', () => startRename(i)));
-    actions.appendChild(actionBtn('reveal seed', () => startReveal(i)));
+    actions.appendChild(actionBtn('show backup', () => startReveal(i)));
     actions.appendChild(actionBtn('remove', () => startRemove(i), 'warn'));
     tr.appendChild(actions);
     tbody.appendChild(tr);
@@ -140,6 +137,7 @@ function startReveal(i) {
   document.getElementById('reveal-passphrase').value = '';
   document.getElementById('reveal-output').hidden = true;
   document.getElementById('reveal-display').textContent = '';
+  document.getElementById('reveal-hex').textContent = '';
   document.getElementById('reveal-section').hidden = false;
   document.getElementById('rename-section').hidden = true;
   document.getElementById('remove-section').hidden = true;
@@ -150,6 +148,7 @@ function cancelReveal() {
   state.revealIdx = null;
   document.getElementById('reveal-passphrase').value = '';
   document.getElementById('reveal-display').textContent = '';
+  document.getElementById('reveal-hex').textContent = '';
   document.getElementById('reveal-section').hidden = true;
 }
 
@@ -166,7 +165,14 @@ async function onRevealSubmit(ev) {
     showError('incorrect passphrase');
     return;
   }
-  document.getElementById('reveal-display').textContent = bytesToHex(seed);
+  const phrase = await decryptPhrase(pass, w);
+  document.getElementById('reveal-display').textContent = phrase || bytesToHex(seed);
+  document.getElementById('reveal-note').textContent = phrase
+    ? `Account ${w.account || 0}. Keep any BIP39 passphrase separately; it is never stored. A wrong passphrase opens a different, empty account.`
+    : 'This wallet has no recovery phrase. Its backup is this hex seed. Wallets made before v2 restore from their hex seed.';
+  document.getElementById('reveal-hex').textContent = bytesToHex(seed);
+  document.getElementById('reveal-advanced').hidden = !phrase;
+  document.getElementById('reveal-advanced').open = false;
   document.getElementById('reveal-output').hidden = false;
 }
 
@@ -200,92 +206,7 @@ function onRenameSubmit(ev) {
 }
 
 function onAddWallet() {
-  document.getElementById('add-name').value = '';
-  document.getElementById('add-mode').value = 'create';
-  document.getElementById('add-seed').value = '';
-  document.getElementById('add-passphrase').value = '';
-  onAddModeChange();
-  const cached = loadCachedUnlock();
-  document.getElementById('add-passphrase-label').hidden = !!cached;
-  document.getElementById('add-passphrase').required = !cached;
-  document.getElementById('add-section').hidden = false;
-  document.getElementById('reveal-section').hidden = true;
-  document.getElementById('rename-section').hidden = true;
-  document.getElementById('remove-section').hidden = true;
-  setTimeout(() => document.getElementById('add-name').focus(), 0);
-}
-
-function onAddModeChange() {
-  const mode = document.getElementById('add-mode').value;
-  document.getElementById('add-seed-label').hidden = (mode !== 'import');
-  document.getElementById('add-seed').required = (mode === 'import');
-}
-
-function cancelAdd() {
-  document.getElementById('add-section').hidden = true;
-  document.getElementById('add-passphrase').value = '';
-  document.getElementById('add-seed').value = '';
-}
-
-async function onAddSubmit(ev) {
-  ev.preventDefault();
-  const name = (document.getElementById('add-name').value.trim() || defaultWalletName()).slice(0, 32);
-  const mode = document.getElementById('add-mode').value;
-  const passInput = document.getElementById('add-passphrase').value;
-  const passphrase = passInput || loadCachedUnlock();
-  if (!passphrase) { showError('enter your passphrase to add a wallet'); return; }
-
-  let seed;
-  if (mode === 'import') {
-    const hex = document.getElementById('add-seed').value.trim().toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(hex)) { showError('seed must be 64 hex characters'); return; }
-    try { seed = hexToBytes(hex, 32); } catch (e) { showError('seed: ' + e.message); return; }
-  } else {
-    seed = randomSeed();
-  }
-
-  if (state.vault && state.vault.wallets.length > 0) {
-    try {
-      await decryptSeed(passphrase, state.vault.wallets[clampActive()]);
-    } catch {
-      showError('incorrect passphrase');
-      return;
-    }
-  }
-
-  const kp = await loadKeyPair(seed);
-  if (state.vault.wallets.find(w => w.address === kp.addressHex)) {
-    showError('a wallet with this address already exists');
-    return;
-  }
-  const entry = await buildWalletEntry(passphrase, name, kp, seed);
-  state.vault.wallets.push(entry);
-  state.vault.active = state.vault.wallets.length - 1;
-  saveVault(state.vault);
-  cacheUnlock(passphrase);
-
-  document.getElementById('add-section').hidden = true;
-  document.getElementById('add-passphrase').value = '';
-  document.getElementById('add-seed').value = '';
-
-  if (mode === 'create') {
-    showInfo(`wallet "${name}" created. seed: ${bytesToHex(seed)} — back this up now (use "reveal seed" later).`);
-  } else {
-    showInfo(`wallet "${name}" imported.`);
-  }
-  render();
-}
-
-function clampActive() {
-  if (!state.vault) return 0;
-  let i = state.vault.active;
-  if (!Number.isInteger(i) || i < 0 || i >= state.vault.wallets.length) i = 0;
-  return i;
-}
-
-function defaultWalletName() {
-  const n = (state.vault && state.vault.wallets.length) || 0;
-  return n === 0 ? 'main' : `wallet ${n + 1}`;
+  location.href = '/wallet/?add=1';
 }
 
 function startRemove(i) {

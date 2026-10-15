@@ -56,13 +56,9 @@ func main() {
 		}
 		switch args[0] {
 		case "create":
-			cmdWalletCreate()
+			cmdWalletCreate(args[1:])
 		case "restore":
-			if len(args) > 1 {
-
-				fatal("wallet restore does not take the phrase as arguments, because they leak into shell history and ps: pipe it on stdin or type it at the prompt, and clear this command from your shell history")
-			}
-			cmdWalletRestore()
+			cmdWalletRestore(args[1:])
 		case "phrase":
 			cmdWalletPhrase()
 		case "balance":
@@ -162,8 +158,9 @@ Node:
                             --wallet (default true)  expose /wallet/ in the embedded UI
 
 Wallet:
-  wallet create           Create a new wallet and show its recovery phrase
-  wallet restore          Restore a wallet from its 24-word recovery phrase,
+  wallet create [--passphrase]  Create a wallet with 24 BIP39 words
+  wallet restore [--account N] [--passphrase]
+                          Restore from 12, 15, 18, 21 or 24 BIP39 words,
                           read from stdin (a prompt, or piped), never from
                           arguments. Refuses to overwrite an existing wallet
   wallet phrase           Show the recovery phrase of the current wallet
@@ -277,7 +274,11 @@ func readWalletSeed(path string) ([]byte, error) {
 	return seed, nil
 }
 
-func cmdWalletCreate() {
+func cmdWalletCreate(args []string) {
+	_, usePassphrase, err := parsePhraseOptions(args, false)
+	if err != nil {
+		fatal("%v", err)
+	}
 	path := walletPath()
 	if _, err := os.Stat(path); err == nil {
 		kp := loadWallet()
@@ -287,17 +288,22 @@ func cmdWalletCreate() {
 		return
 	}
 
-	kp, err := core.GenerateKeyPair()
+	if err := checkPhraseFileAbsent(path); err != nil {
+		fatal("%v", err)
+	}
+	phrase, err := core.NewRecoveryPhrase()
 	if err != nil {
-		fatal("generate keypair: %v", err)
+		fatal("generate phrase: %v", err)
 	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		fatal("create wallet dir: %v", err)
+	passphrase, err := promptBIP39Passphrase(usePassphrase, true)
+	if err != nil {
+		fatal("%v", err)
 	}
-
-	seedHex := hex.EncodeToString(kp.Private.Seed())
-	if err := os.WriteFile(path, []byte(seedHex+"\n"), 0600); err != nil {
+	kp, err := core.KeyPairFromPhrase(phrase, passphrase, 0)
+	if err != nil {
+		fatal("derive wallet: %v", err)
+	}
+	if err := writeNewPhraseWallet(path, kp.Private.Seed(), phrase, 0); err != nil {
 		fatal("write wallet: %v", err)
 	}
 
@@ -307,18 +313,109 @@ func cmdWalletCreate() {
 	fmt.Printf("  Public key: %s\n", kp.PubKeyHex())
 	fmt.Printf("  File:       %s\n", path)
 
-	phrase, err := core.PhraseFromSeed(kp.Private.Seed())
-	if err != nil {
-		fatal("recovery phrase: %v", err)
-	}
 	fmt.Printf("\nRecovery phrase:\n\n")
 	printNumberedPhrase(phrase)
 	fmt.Printf("\n%s\n", recoveryPhraseWarning)
 }
 
-const recoveryPhraseWarning = `Write these 24 words down and keep them safe. They are the only backup of this
-wallet, and anyone who has them controls it. Only XE software can restore them:
-a standard BIP39 wallet reads the same words as a different, empty account.`
+const recoveryPhraseWarning = `Write these words down and keep them safe. The recovery phrase is your only
+backup unless you separately keep the hex seed. Anyone with the backup controls
+the wallet. XE uses standard BIP39 + SLIP-0010 ed25519, m/44'/1'/account'.
+Coin type 1 is provisional. Keep your account index with your backup.
+If you opted into a BIP39 passphrase, you must also keep it separately: it is
+never stored. A wrong passphrase opens a different, empty account.
+Wallets made before v2 restore from their hex seed (wallet.seed).`
+
+func parsePhraseOptions(args []string, allowAccount bool) (uint32, bool, error) {
+	var account uint32
+	var passphrase bool
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--passphrase":
+			passphrase = true
+		case "--account":
+			if !allowAccount || i+1 == len(args) {
+				return 0, false, errors.New("--account requires an index on wallet restore")
+			}
+			i++
+			n, err := strconv.ParseUint(args[i], 10, 31)
+			if err != nil {
+				return 0, false, core.ErrPhraseAccount
+			}
+			account = uint32(n)
+		default:
+			return 0, false, errors.New("wallet accepts only --passphrase and restore --account N; never put words or a passphrase on argv")
+		}
+	}
+	return account, passphrase, nil
+}
+
+func promptBIP39Passphrase(enabled, confirm bool) (string, error) {
+	if !enabled {
+		return "", nil
+	}
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return "", errors.New("--passphrase requires a terminal for hidden input")
+	}
+	defer func() { _ = tty.Close() }()
+	fmt.Fprintln(os.Stderr, "A wrong BIP39 passphrase opens a different, empty account. It is never stored.")
+	pass, err := withHiddenTerminal(int(tty.Fd()), func() (string, error) {
+		return readBIP39Passphrase(confirm, func(prompt string) (string, error) {
+			fmt.Fprint(os.Stderr, prompt)
+			line, err := term.ReadPassword(int(tty.Fd()))
+			fmt.Fprint(os.Stderr, "\r\n")
+			return string(line), err
+		})
+	})
+	if err != nil {
+		return "", err
+	}
+	return pass, nil
+}
+
+func readBIP39Passphrase(confirm bool, read func(string) (string, error)) (string, error) {
+	pass, err := read("BIP39 passphrase (hidden): ")
+	if err != nil {
+		return "", fmt.Errorf("read BIP39 passphrase: %w", err)
+	}
+	if confirm {
+		repeated, err := read("Confirm BIP39 passphrase (hidden): ")
+		if err != nil {
+			return "", fmt.Errorf("confirm BIP39 passphrase: %w", err)
+		}
+		if pass != repeated {
+			return "", errors.New("BIP39 passphrases do not match; wallet was not created")
+		}
+	}
+	return pass, nil
+}
+
+func withHiddenTerminal(fd int, read func() (string, error)) (string, error) {
+	state, err := term.GetState(fd)
+	if err != nil {
+		return "", err
+	}
+	sig := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	defer close(done)
+	go func() {
+		select {
+		case <-sig:
+			_ = term.Restore(fd, state)
+			fmt.Fprintln(os.Stderr)
+			os.Exit(130)
+		case <-done:
+		}
+	}()
+	if _, err := term.MakeRaw(fd); err != nil {
+		return "", err
+	}
+	defer func() { _ = term.Restore(fd, state) }()
+	return read()
+}
 
 func printNumberedPhrase(phrase string) {
 	for i, word := range strings.Fields(phrase) {
@@ -330,31 +427,37 @@ func printNumberedPhrase(phrase string) {
 	}
 }
 
-func cmdWalletRestore() {
+func cmdWalletRestore(args []string) {
+	account, usePassphrase, err := parsePhraseOptions(args, true)
+	if err != nil {
+		fatal("%v", err)
+	}
 	path := walletPath()
 
 	if _, err := os.Stat(path); err == nil {
 		fatal("%v", errWalletExists(path))
 	}
-
-	var in io.Reader = os.Stdin
-	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
-
-		if state, err := term.GetState(fd); err == nil {
-			sig := make(chan os.Signal, 1)
-			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-			go func() {
-				<-sig
-				_ = term.Restore(fd, state)
-				fmt.Fprintln(os.Stderr)
-				os.Exit(130)
-			}()
-		}
-		fmt.Fprintf(os.Stderr, "Enter your %d-word recovery phrase, one or more words per line. Input is hidden.\n", core.RecoveryPhraseWords)
-		in = &hiddenLineReader{fd: fd}
+	if err := checkPhraseFileAbsent(path); err != nil {
+		fatal("%v", err)
 	}
 
-	kp, err := restoreWallet(in, path)
+	var phrase string
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		phrase, err = withHiddenTerminal(fd, func() (string, error) {
+			fmt.Fprint(os.Stderr, "Enter 12, 15, 18, 21 or 24 words. Input is hidden. End shorter phrases with a blank line.\r\n")
+			return readPhrase(&hiddenLineReader{fd: fd})
+		})
+	} else {
+		phrase, err = readPhrase(os.Stdin)
+	}
+	if err != nil {
+		fatal("%v", err)
+	}
+	passphrase, err := promptBIP39Passphrase(usePassphrase, false)
+	if err != nil {
+		fatal("%v", err)
+	}
+	kp, err := restorePhraseWallet(phrase, passphrase, account, path)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -362,6 +465,8 @@ func cmdWalletRestore() {
 	fmt.Printf("  Address:    %s\n", kp.Address())
 	fmt.Printf("  Public key: %s\n", kp.PubKeyHex())
 	fmt.Printf("  File:       %s\n", path)
+	fmt.Printf("  Account:    %d\n", account)
+	fmt.Fprintln(os.Stderr, recoveryPhraseWarning)
 }
 
 func restoreWallet(r io.Reader, path string) (*core.KeyPair, error) {
@@ -369,14 +474,64 @@ func restoreWallet(r io.Reader, path string) (*core.KeyPair, error) {
 	if err != nil {
 		return nil, err
 	}
-	seed, err := core.SeedFromPhrase(phrase)
+	return restorePhraseWallet(phrase, "", 0, path)
+}
+
+func restorePhraseWallet(phrase, passphrase string, account uint32, path string) (*core.KeyPair, error) {
+	kp, err := core.KeyPairFromPhrase(phrase, passphrase, account)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeNewWalletSeed(path, seed); err != nil {
+	if err := writeNewPhraseWallet(path, kp.Private.Seed(), core.NormalizePhrase(phrase), account); err != nil {
 		return nil, err
 	}
-	return core.KeyPairFromSeed(seed), nil
+	return kp, nil
+}
+
+func walletPhrasePath(path string) string {
+	return strings.TrimSuffix(path, ".seed") + ".phrase"
+}
+
+func errWalletPhraseExists(path string) error {
+	return fmt.Errorf("recovery phrase file already exists at %s; refusing to overwrite it", path)
+}
+
+func checkPhraseFileAbsent(path string) error {
+	phrasePath := walletPhrasePath(path)
+	_, err := os.Lstat(phrasePath)
+	if err == nil {
+		return errWalletPhraseExists(phrasePath)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check wallet phrase: %w", err)
+	}
+	return nil
+}
+
+func writeNewPhraseWallet(path string, seed []byte, phrase string, account uint32) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	phrasePath := walletPhrasePath(path)
+	f, err := os.OpenFile(phrasePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return errWalletPhraseExists(phrasePath)
+	}
+	if err != nil {
+		return fmt.Errorf("create wallet phrase: %w", err)
+	}
+	address := core.KeyPairFromSeed(seed).Address()
+	_, err = fmt.Fprintf(f, "%s\naccount: %d\naddress: %s\n", core.NormalizePhrase(phrase), account, address)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = writeNewWalletSeed(path, seed)
+	}
+	if err != nil {
+		_ = os.Remove(phrasePath)
+	}
+	return err
 }
 
 func readPhrase(r io.Reader) (string, error) {
@@ -430,8 +585,11 @@ func (h *hiddenLineReader) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		if len(strings.Fields(string(line))) == 0 {
+			return 0, io.EOF
+		}
 		h.words += len(strings.Fields(string(line)))
-		fmt.Fprintf(os.Stderr, "  %d of %d words\n", h.words, core.RecoveryPhraseWords)
+		fmt.Fprintf(os.Stderr, "  %d of %d words\r\n", h.words, core.RecoveryPhraseWords)
 		h.buf = append(line, '\n')
 	}
 	n := copy(p, h.buf)
@@ -453,7 +611,32 @@ func walletPhrase(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return core.PhraseFromSeed(seed)
+	data, err := os.ReadFile(walletPhrasePath(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", errors.New("this wallet was created from a hex seed and has no recovery phrase; its backup is wallet.seed")
+	}
+	if err != nil {
+		return "", fmt.Errorf("read wallet phrase: %w", err)
+	}
+	lines := strings.Split(string(data), "\n")
+	address := core.KeyPairFromSeed(seed).Address()
+	addressCount := 0
+	for _, line := range lines[1:] {
+		if strings.HasPrefix(line, "address:") {
+			if line != "address: "+address {
+				return "", errors.New("the phrase file does not belong to this wallet; its backup is wallet.seed")
+			}
+			addressCount++
+		}
+	}
+	if addressCount != 1 {
+		return "", errors.New("the phrase file does not belong to this wallet; its backup is wallet.seed")
+	}
+	phrase := lines[0]
+	if err := core.ValidatePhrase(phrase); err != nil {
+		return "", err
+	}
+	return phrase, nil
 }
 
 func cmdWalletBalance() {

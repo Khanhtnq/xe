@@ -22,34 +22,52 @@
 
     <section id="setup-section" class="section-card" hidden>
       <h2>set up wallet</h2>
-      <p class="muted">your seed lives only in this browser, in <code>localStorage</code>, encrypted with a passphrase you choose. no key ever leaves your device.</p>
+      <p class="muted">Your seed and recovery phrase are encrypted in this browser with your vault password. No key leaves your device.</p>
       <div class="actions">
         <button id="btn-create">create new wallet</button>
         <span class="muted">or</span>
-        <button id="btn-import-toggle">import existing seed</button>
+        <button id="btn-import-toggle">import phrase or hex seed</button>
+        <button id="btn-next-account" hidden>next account from this phrase</button>
       </div>
       <form id="setup-form" class="passphrase-form">
         <label>name (optional)
           <input type="text" id="setup-name" autocomplete="off" placeholder="main" maxlength="32">
         </label>
-        <label>passphrase (encrypts your seed in localStorage)
+        <label>vault password (encrypts this browser's backup)
           <input type="password" id="setup-passphrase" autocomplete="new-password" minlength="8" required>
         </label>
-        <label>confirm passphrase
+        <label>confirm vault password
           <input type="password" id="setup-passphrase-confirm" autocomplete="new-password" minlength="8" required>
         </label>
-        <label class="seed-input-label" id="setup-seed-label" hidden>seed (64 hex characters)
-          <input type="text" id="setup-seed-input" autocomplete="off" placeholder="0123abcd…" minlength="64" maxlength="64" pattern="[0-9a-fA-F]{64}">
+        <label class="seed-input-label" id="setup-seed-label" hidden>recovery phrase or hex seed
+          <input type="password" id="setup-seed-input" autocomplete="off" spellcheck="false" autocapitalize="off">
         </label>
+        <details id="setup-advanced">
+          <summary>advanced: BIP39 passphrase and account</summary>
+          <label><input type="checkbox" id="setup-bip39-enabled"> use a BIP39 passphrase</label>
+          <label>BIP39 passphrase (never stored)
+            <input type="password" id="setup-bip39-passphrase" autocomplete="off" spellcheck="false" disabled>
+          </label>
+          <label id="setup-bip39-confirm-label" hidden>confirm BIP39 passphrase (must match exactly)
+            <input type="password" id="setup-bip39-passphrase-confirm" autocomplete="off" spellcheck="false" disabled>
+          </label>
+          <p class="muted">This differs from your vault password. Keep it separately. A wrong passphrase opens a different, empty account. Avoid a weak passphrase.</p>
+          <label>account index (import only)
+            <input type="number" id="setup-account" min="0" max="2147483647" step="1" value="0" disabled>
+          </label>
+        </details>
         <button type="submit" id="setup-submit">create wallet</button>
       </form>
+      <p class="muted">Standard BIP39 + SLIP-0010 ed25519, m/44'/1'/account'. Coin type 1 is provisional. Wallets made before v2 restore from their hex seed.</p>
       <section id="seed-confirm-section" class="seed-confirm" hidden>
-        <h2>back up your seed</h2>
-        <p class="muted">copy this seed somewhere safe (password manager, paper). anyone with it can spend everything in this account.</p>
+        <h2>back up your recovery phrase</h2>
+        <p class="muted">These 24 words are your only backup unless you keep the hex seed separately. Anyone with your backup can spend your funds. Keep any BIP39 passphrase separately; it is never stored.</p>
         <pre id="seed-confirm-display" class="raw-pre"></pre>
+        <details id="seed-confirm-advanced"><summary>advanced: hex seed</summary><pre id="seed-confirm-hex" class="raw-pre"></pre></details>
+        <div id="phrase-checks" class="passphrase-form" hidden></div>
         <div class="actions">
-          <button id="btn-copy-confirm-seed">copy seed</button>
-          <label class="checkbox-line"><input type="checkbox" id="seed-saved-check"> I have saved my seed securely</label>
+          <button id="btn-copy-confirm-seed">copy phrase</button>
+          <label class="checkbox-line"><input type="checkbox" id="seed-saved-check"> I have saved my phrase securely</label>
           <button id="btn-confirm-seed-saved" disabled>continue</button>
         </div>
       </section>
@@ -162,14 +180,16 @@
       </section>
 
       <section class="reveal-section section-card">
-        <h2>seed</h2>
-        <p class="muted">re-enter your passphrase to display the seed for this wallet.</p>
+        <h2>backup</h2>
+        <p class="muted">Re-enter your vault password to show your backup.</p>
         <form id="reveal-form" class="passphrase-form inline-form">
           <input type="password" id="reveal-passphrase" placeholder="passphrase" autocomplete="current-password" required>
-          <button type="submit">reveal seed</button>
+          <button type="submit">show backup</button>
         </form>
         <div id="reveal-output" hidden>
           <pre id="reveal-display" class="raw-pre"></pre>
+          <p id="reveal-note" class="muted"></p>
+          <details id="reveal-advanced"><summary>advanced: hex seed</summary><pre id="reveal-hex" class="raw-pre"></pre></details>
           <div class="actions" style="margin-top:0.5rem">
             <button type="button" id="btn-copy-reveal">copy</button>
             <button type="button" id="btn-hide-reveal">hide</button>

@@ -123,15 +123,38 @@ export async function decryptSeed(passphrase, walletEntry) {
   return plaintext;
 }
 
-export async function buildWalletEntry(passphrase, name, keyPair, seedBytes) {
+export async function buildWalletEntry(passphrase, name, keyPair, seedBytes, recovery = null) {
   const enc = await encryptSeed(passphrase, seedBytes);
+  let phraseFields = {};
+  if (recovery) {
+    const key = await deriveKey(passphrase, b64ToBytes(enc.salt), enc.iterations);
+    const iv = randomBytes(IV_BYTES);
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv }, key, new TextEncoder().encode(recovery.phrase),
+    );
+    phraseFields = {
+      encrypted_phrase: bytesToB64(new Uint8Array(ciphertext)),
+      phrase_iv: bytesToB64(iv),
+      account: recovery.account,
+    };
+  }
   return {
     name,
     address: keyPair.addressHex,
     pub_key: keyPair.pubKeyHex,
     created_at: Date.now(),
     ...enc,
+    ...phraseFields,
   };
+}
+
+export async function decryptPhrase(passphrase, entry) {
+  if (!entry.encrypted_phrase) return null;
+  const key = await deriveKey(passphrase, b64ToBytes(entry.salt), entry.iterations || PBKDF2_ITERATIONS);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: b64ToBytes(entry.phrase_iv) }, key, b64ToBytes(entry.encrypted_phrase),
+  );
+  return new TextDecoder().decode(plaintext);
 }
 
 export function syncWalletIdentity(entry, keyPair) {
